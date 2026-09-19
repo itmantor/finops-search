@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>جستجوی شناسه کالا و خدمت — V2</title>
+<style>
+  @import url('https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css');
+  * { margin:0; padding:0; box-sizing:border-box; font-family:'Vazirmatn',Tahoma,sans-serif; }
+  body { background:#0D1117; color:#E6EDF3; padding:20px; line-height:1.8; }
+  .wrap { max-width:920px; margin:0 auto; }
+  .header { text-align:center; margin-bottom:20px; }
+  .header h1 { font-size:24px; font-weight:700; color:#00C896; margin-bottom:4px; }
+  .header p { font-size:13px; color:#8B949E; }
+  .card { background:#161B22; border:1px solid #30363D; border-radius:14px; padding:18px; margin-bottom:14px; }
+  .search-box { display:flex; gap:10px; margin-bottom:12px; }
+  .input { width:100%; background:#0D1117; border:1px solid #30363D; border-radius:10px; padding:10px 14px; color:#E6EDF3; font-size:15px; outline:none; }
+  .input:focus { border-color:#00C896; }
+  .btn { background:#00C896; color:#000; border:none; border-radius:10px; padding:10px 22px; font-size:14px; font-weight:700; cursor:pointer; white-space:nowrap; }
+  .btn:hover { background:#00A37A; }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .mode-tabs { display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap; }
+  .tab { background:#0D1117; border:1px solid #30363D; border-radius:8px; padding:8px 16px; font-size:13px; cursor:pointer; transition:.15s; }
+  .tab:hover { border-color:#00C896; }
+  .tab.active { background:rgba(0,200,150,.15); border-color:#00C896; color:#00C896; font-weight:700; }
+  .filters { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .chip { background:#0D1117; border:1px solid #30363D; border-radius:20px; padding:5px 14px; font-size:12px; cursor:pointer; transition:.15s; }
+  .chip:hover { border-color:#00C896; }
+  .chip.active { background:rgba(0,200,150,.15); border-color:#00C896; color:#00C896; }
+  .toggle { display:flex; align-items:center; gap:6px; font-size:12px; color:#8B949E; cursor:pointer; margin-inline-start:auto; }
+  .stats { font-size:13px; color:#8B949E; margin:14px 0 10px; }
+  .result { background:#161B22; border:1px solid #30363D; border-radius:10px; padding:13px 16px; margin-bottom:8px; transition:.15s; }
+  .result:hover { border-color:#00C896; }
+  .result-top { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:6px; flex-wrap:wrap; }
+  .result-id { font-size:17px; font-weight:700; color:#00C896; direction:ltr; letter-spacing:1px; }
+  .result-right { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .result-score { font-size:11px; padding:3px 9px; border-radius:6px; background:rgba(0,200,150,.1); color:#00C896; }
+  .result-exact { font-size:11px; padding:3px 9px; border-radius:6px; background:rgba(248,81,73,.15); color:#F85149; font-weight:700; }
+  .result-type { font-size:11px; padding:3px 10px; border-radius:6px; background:rgba(139,92,246,.15); color:#A78BFA; white-space:nowrap; }
+  .result-type.general { background:rgba(0,200,150,.12); color:#00C896; }
+  .result-level1 { font-size:11px; padding:3px 10px; border-radius:6px; background:rgba(88,166,255,.12); color:#58A6FF; white-space:nowrap; }
+  .result-desc { font-size:13px; color:#C9D1D9; }
+  .result-copy { font-size:11px; color:#58A6FF; cursor:pointer; margin-top:6px; display:inline-block; }
+  .empty { text-align:center; padding:28px; color:#8B949E; font-size:14px; }
+  .status-bar { display:flex; gap:16px; flex-wrap:wrap; font-size:12px; color:#8B949E; }
+  .status-item { display:flex; align-items:center; gap:5px; }
+  .dot { width:8px; height:8px; border-radius:50%; background:#F85149; }
+  .dot.ok { background:#00C896; }
+  .spinner { display:inline-block; width:14px; height:14px; border:2px solid #30363D; border-top-color:#00C896; border-radius:50%; animation:spin .7s linear infinite; vertical-align:middle; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="header">
+    <h1>جستجوی شناسه کالا و خدمت</h1>
+    <p>نسخه V2 — جستجوی متنی، معنایی و ترکیبی با دسته‌بندی خودکار</p>
+  </div>
+
+  <div class="card">
+    <div class="status-bar" id="statusBar">
+      <div class="status-item"><span class="dot" id="dotFile"></span><span id="statFile">در حال بررسی...</span></div>
+      <div class="status-item"><span class="dot" id="dotKey"></span><span id="statKey">در حال بررسی...</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="mode-tabs">
+      <div class="tab active" id="tabText" onclick="setMode('text')">جستجوی متنی (رایگان)</div>
+      <div class="tab" id="tabSemantic" onclick="setMode('semantic')">جستجوی معنایی</div>
+    </div>
+    <div class="search-box">
+      <input class="input" id="q" placeholder="شرح کالا را بنویسید... مثلاً: تیرچه بلوک" onkeydown="if(event.key==='Enter')doSearch()">
+      <button class="btn" onclick="doSearch()" id="searchBtn">جستجو</button>
+    </div>
+    <div class="filters">
+      <div class="chip active" onclick="setFilter(this,'all')">همه</div>
+      <div class="chip" onclick="setFilter(this,'general')">فقط عمومی</div>
+      <div class="chip" onclick="setFilter(this,'specific')">فقط اختصاصی</div>
+      <label class="toggle" id="rerankToggleWrap" style="display:none">
+        <input type="checkbox" id="rerankToggle"> GPT ReRank (دقیق‌تر، کمی کندتر)
+      </label>
+    </div>
+  </div>
+
+  <div class="stats" id="stats"></div>
+  <div id="results"></div>
+</div>
+
+<script>
+let mode = 'text';
+let filter = 'all';
+
+async function refreshStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const s = await r.json();
+    setDot('dotFile', 'statFile', s.has_index,
+      s.has_index ? s.record_count.toLocaleString('fa') + ' رکورد آماده جستجو' : 'ایندکس جستجو ساخته نشده — پایپ‌لاین را اجرا کنید');
+    setDot('dotKey', 'statKey', s.has_api_key,
+      s.has_api_key ? 'کلید OpenAI فعال است' : 'کلید OpenAI تنظیم نشده (فقط جستجوی متنی کار می‌کند)');
+  } catch (e) {
+    document.getElementById('statFile').textContent = 'خطا در ارتباط با سرور';
+  }
+}
+
+function setDot(dotId, statId, ok, text) {
+  document.getElementById(dotId).className = 'dot' + (ok ? ' ok' : '');
+  document.getElementById(statId).textContent = text;
+}
+
+function setMode(m) {
+  mode = m;
+  document.getElementById('tabText').classList.toggle('active', m === 'text');
+  document.getElementById('tabSemantic').classList.toggle('active', m === 'semantic');
+  document.getElementById('rerankToggleWrap').style.display = (m === 'semantic') ? 'flex' : 'none';
+}
+
+function setFilter(el, t) {
+  document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+  el.classList.add('active');
+  filter = t;
+}
+
+async function doSearch() {
+  const query = document.getElementById('q').value.trim();
+  const results = document.getElementById('results');
+  const stats = document.getElementById('stats');
+  if (!query) { results.innerHTML = ''; stats.textContent = ''; return; }
+
+  const rerank = mode === 'semantic' && document.getElementById('rerankToggle').checked;
+  stats.innerHTML = '<span class="spinner"></span> در حال جستجو...';
+  results.innerHTML = '';
+
+  try {
+    const r = await fetch('/api/search', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({query, mode, type_filter: filter, rerank})
+    });
+    const res = await r.json();
+    if (res.error) { stats.textContent = ''; results.innerHTML = '<div class="empty">' + res.error + '</div>'; return; }
+
+    const matched = res.results || [];
+    stats.textContent = matched.length + ' نتیجه' + (mode === 'semantic' ? ' (مرتب‌شده بر اساس شباهت معنایی + کلیدواژه)' : '');
+    if (matched.length === 0) {
+      results.innerHTML = '<div class="empty">نتیجه‌ای پیدا نشد.</div>';
+      return;
+    }
+    results.innerHTML = matched.map(r => `
+      <div class="result">
+        <div class="result-top">
+          <span class="result-id">${r.id}</span>
+          <div class="result-right">
+            ${r.match_type === 'exact' ? '<span class="result-exact">تطابق دقیق</span>' : (r.score !== undefined ? '<span class="result-score">شباهت ' + r.score + '٪</span>' : '')}
+            ${r.level1 ? '<span class="result-level1">' + r.level1 + '</span>' : ''}
+            <span class="result-type ${r.type && r.type.includes('عمومی') ? 'general' : ''}">${r.type || ''}</span>
+          </div>
+        </div>
+        <div class="result-desc">${r.desc}</div>
+        <span class="result-copy" onclick="copyId('${r.id}',this)">📋 کپی شناسه</span>
+      </div>
+    `).join('');
+  } catch (e) {
+    stats.textContent = ''; results.innerHTML = '<div class="empty">خطا: ' + e + '</div>';
+  }
+}
+
+function copyId(id, el) {
+  navigator.clipboard.writeText(id);
+  el.textContent = '✓ کپی شد';
+  setTimeout(() => el.textContent = '📋 کپی شناسه', 1500);
+}
+
+refreshStatus();
+</script>
+</body>
+</html>

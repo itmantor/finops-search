@@ -1,0 +1,19 @@
+# اطلاعات محرمانه
+.env
+
+# داده‌ها و خروجی‌های سنگین (قابل بازتولید با اجرای پایپ‌لاین)
+data/*.csv
+data/*.xlsx
+data/*.xls
+checkpoints/
+outputs/
+
+# پایتون
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# فایل قدیمی ناامن — اگر از نسخه قبلی باقی مانده، نباید commit شود
+config.json
+embeddings.pkl
