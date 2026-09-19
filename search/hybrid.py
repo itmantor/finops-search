@@ -23,10 +23,14 @@ class HybridIndex:
         self.semantic = semantic if semantic is not None else SemanticIndex()
 
     def search(self, query, k=40):
-        """جستجو در هر دو کانال و ترکیب نتایج با RRF."""
+        """جستجو در هر دو کانال (با همان پرس‌وجو) و ترکیب نتایج با RRF."""
+        return self.search_split(query, query, k=k)
+
+    def search_split(self, lexical_query, semantic_query, k=40):
+        """جستجو با پرس‌وجوی متفاوت برای هر کانال (مثلاً بعد از فهم پرس‌وجو) و ترکیب با RRF."""
         channel_results = [
-            self.lexical.search(query, k=TOP_PER_CHANNEL),
-            self.semantic.search(query, k=TOP_PER_CHANNEL),
+            self.lexical.search(lexical_query, k=TOP_PER_CHANNEL),
+            self.semantic.search(semantic_query, k=TOP_PER_CHANNEL),
         ]
 
         scores = defaultdict(float)

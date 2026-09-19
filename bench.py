@@ -5,6 +5,11 @@
 benchmark.json را می‌خواند، هر پرس‌وجو را با یک یا چند کانال جستجو
 (lexical / semantic / hybrid) اجرا می‌کند و recall@40، recall@5، MRR و
 جدول جزئیات هر مورد را چاپ می‌کند.
+
+با پرچم --understand، هر پرس‌وجو پیش از بازیابی از search/understand.py
+عبور می‌کند: کانال واژگانی عبارت پاک‌شده + کلیدواژه‌ها را می‌گیرد (شبکه‌ی
+توکن گسترده برای BM25) و کانال معنایی فقط عبارت پاک‌شده را (یک بردار
+یکپارچه، بدون رقیق‌شدن).
 """
 import argparse
 import json
@@ -52,8 +57,30 @@ def build_indices(modes):
     return indices
 
 
-def run_mode(mode, index, cases):
-    """اجرای محک برای یک کانال؛ چاپ جدول جزئیات و بازگرداندن آمار."""
+def make_search_fn(mode, index, understander):
+    """ساخت تابع search(query) -> results برای یک کانال، با یا بدون فهم پرس‌وجو."""
+    if mode == "hybrid":
+        def fn(query):
+            if understander is None:
+                return index.search(query, k=TOP_K)
+            lex_q = understander.lexical_query(query)
+            sem_q = understander.semantic_query(query)
+            return index.search_split(lex_q, sem_q, k=TOP_K)
+        return fn
+
+    def fn(query):
+        if understander is None:
+            q = query
+        elif mode == "lexical":
+            q = understander.lexical_query(query)
+        else:  # semantic
+            q = understander.semantic_query(query)
+        return index.search(q, k=TOP_K)
+    return fn
+
+
+def run_mode(label, search_fn, cases):
+    """اجرای محک برای یک کانال (با label دلخواه)؛ چاپ جدول جزئیات و بازگرداندن آمار."""
     hits_40 = 0
     hits_5 = 0
     reciprocal_ranks = []
@@ -62,7 +89,7 @@ def run_mode(mode, index, cases):
     for case in cases:
         query = case["query"]
         expected = case["expected_descriptions"]
-        results = index.search(query, k=TOP_K)
+        results = search_fn(query)
         rank, matched_desc = find_rank(results, expected)
 
         if rank is not None:
@@ -83,7 +110,7 @@ def run_mode(mode, index, cases):
     }
 
     print("=" * 100)
-    print(f"حالت: {mode}")
+    print(f"حالت: {label}")
     print("=" * 100)
     print(f"{'#':>3}  {'رتبه':>6}  {'پرس‌وجو':<45} {'شرح یافت‌شده / منتظره'}")
     print("-" * 100)
@@ -113,18 +140,31 @@ def print_comparison(all_stats):
     print("=" * 60)
     print("جدول مقایسه‌ی کانال‌ها")
     print("=" * 60)
-    print(f"{'حالت':<12} {'recall@40':>10} {'recall@5':>10} {'MRR':>8}")
-    for mode in MODES:
-        if mode not in all_stats:
-            continue
-        s = all_stats[mode]
-        print(f"{mode:<12} {s['recall@40']:>10.3f} {s['recall@5']:>10.3f} {s['mrr']:>8.3f}")
+    print(f"{'حالت':<20} {'recall@40':>10} {'recall@5':>10} {'MRR':>8}")
+    for label, s in all_stats.items():
+        print(f"{label:<20} {s['recall@40']:>10.3f} {s['recall@5']:>10.3f} {s['mrr']:>8.3f}")
+
+
+def print_understanding(cases, understander):
+    print("=" * 100)
+    print("خروجی فهم پرس‌وجو (query understanding)")
+    print("=" * 100)
+    for i, case in enumerate(cases, start=1):
+        query = case["query"]
+        u = understander.understand(query)
+        print(f"{i:>3}. خام:      {query}")
+        print(f"     برند:      {u.get('brand', '')}")
+        print(f"     پاک‌شده:   {u.get('clean', '')}")
+        print(f"     کلیدواژه‌ها: {'، '.join(u.get('keywords', []))}")
+        print()
 
 
 def main():
     parser = argparse.ArgumentParser(description="اجرای محک روی کانال‌های جستجو")
     parser.add_argument("--mode", choices=MODES, default="hybrid")
     parser.add_argument("--all", action="store_true", help="اجرای هر سه حالت و چاپ جدول مقایسه")
+    parser.add_argument("--understand", action="store_true",
+                         help="عبور پرس‌وجو از فهم پرس‌وجو (search/understand.py) پیش از بازیابی")
     args = parser.parse_args()
 
     modes = MODES if args.all else [args.mode]
@@ -133,13 +173,32 @@ def main():
         benchmark = json.load(f)
     cases = benchmark["cases"]
 
+    understander = None
+    if args.understand:
+        from search.understand import QueryUnderstander
+        understander = QueryUnderstander()
+        print_understanding(cases, understander)
+
     print("در حال ساخت ایندکس(ها)...")
     indices = build_indices(modes)
     print("ایندکس(ها) آماده شد.\n")
 
+    # با --all --understand، برای هر حالت هم بدون و هم با فهم پرس‌وجو اجرا می‌شود
+    # (۶ ردیف مقایسه)؛ در غیر این صورت فقط با/بدون فهم بسته به --understand.
+    variants = []
+    if args.all and args.understand:
+        for mode in modes:
+            variants.append((mode, f"{mode} (بدون فهم)", None))
+            variants.append((mode, f"{mode} (با فهم)", understander))
+    else:
+        for mode in modes:
+            label = f"{mode} (با فهم)" if args.understand else mode
+            variants.append((mode, label, understander))
+
     all_stats = {}
-    for mode in modes:
-        all_stats[mode] = run_mode(mode, indices[mode], cases)
+    for mode, label, u in variants:
+        search_fn = make_search_fn(mode, indices[mode], u)
+        all_stats[label] = run_mode(label, search_fn, cases)
 
     if args.all:
         print_comparison(all_stats)
