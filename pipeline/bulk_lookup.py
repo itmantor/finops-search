@@ -23,7 +23,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from common.config import OPENAI_API_KEY
 from common.textnorm import tokenize
-from search.ambiguity import compute_ambiguity, representative_per_group, resolve_with_context
+from search.ambiguity import (
+    apply_context_boost, compute_ambiguity,
+    representative_per_group, resolve_ambiguous_group_by_context,
+)
 from search.engine import load_engine
 from search.taxonomy_labels import label_for
 
@@ -115,11 +118,22 @@ def process_row(engine, mode, row):
     شرح(core) و زمینه(دسته کالا/توضیحات بیشتر) دو نقش کاملاً جدا دارند:
     - core (شرح با برند-زدایی قطعی) تنها چیزی است که به فهم پرس‌وجو/بازیابی
       داده می‌شود و فیلتر AND ابهام را می‌سازد.
-    - زمینه هرگز وارد بازیابی نمی‌شود (چرا: در پایین process_row توضیح داده
-      شده)؛ فقط بعد از بازیابی، مستقل از این‌که ابهام تشخیص داده شده یا نه،
-      رتبه‌ی اول را تأیید یا اصلاح می‌کند (search.ambiguity.resolve_with_context؛
-      دلیل مستقل‌بودن از پرچم ابهام آنجا توضیح داده شده — خلاصه: بعضی جواب‌های
-      غلط اصلاً «مبهم» تشخیص داده نمی‌شوند، فقط با اطمینان اشتباه‌اند).
+    - زمینه هرگز وارد بازیابی (فهم پرس‌وجو/BM25/embedding) نمی‌شود — با
+      آزمایش مستقیم تأیید شد که اگر زمینه هم داخل متنی برود که به مدل داده
+      می‌شود، مدل کلماتِ زمینه را وارد keywords خودش می‌کند و همین BM25/RRF
+      را به‌سمت زمینه منحرف می‌کند، حتی برای سطرهایی که واقعاً به آن دسته
+      تعلق ندارند. زمینه یک متن ثابت است که معمولاً یکسان روی همه‌ی سطرهای
+      فایل اعمال می‌شود، پس نباید بتواند نتیجه‌ی سطرهایی را که واقعاً به آن
+      ربطی ندارند خراب کند. به‌جایش، بعد از بازیابی خالص core، فقط امتیاز
+      کاندیدهای هم‌دسته با زمینه کمی boost می‌شود (search.ambiguity.
+      apply_context_boost) — یک فیلتر سخت نیست: اگر بهترین کاندید boost‌شده
+      خیلی ضعیف‌تر از بهترین کاندید boost‌نشده باشد، رتبه‌ی اول عوض نمی‌شود
+      (مثلاً «روتختی» با boost هم به‌غلط «روتختی بیمارستانی» نمی‌شود، چون
+      نسخه‌ی عمومی‌اش به‌وضوح قوی‌تر است؛ اما «چشم‌بند» که تقریباً مساوی
+      رتبه‌بندی شده، به نسخه‌ی پزشکی/زمینه‌دار می‌رود).
+    - حتی بعد از boost، اگر رتبه‌ی اول نهایی هیچ توکن معناداری از پرس‌وجو را
+      در متن خودش نداشته باشد (has_token_support)، «یافت شد» قاطع اما بی‌ربط
+      اعلام نمی‌شود — به‌جایش «نیاز به بررسی» با چند گزینه‌ی نماینده.
     """
     core = build_core_text(row)
     context = build_context_text(row)
@@ -130,16 +144,6 @@ def process_row(engine, mode, row):
     if not core_tokens:
         return _not_found_record()
 
-    # فهم پرس‌وجو فقط روی core اجرا می‌شود، نه core+context هم‌جا: با آزمایش
-    # مستقیم تأیید شد که اگر زمینه هم داخل متنی برود که به مدل داده می‌شود، مدل
-    # کلماتِ زمینه را وارد keywords خودش می‌کند و همین BM25/RRF را به‌سمت زمینه
-    # منحرف می‌کند — حتی برای سطرهایی که واقعاً به آن دسته تعلق ندارند (مثلاً
-    # «تیرچه بلوک» + زمینه‌ی نامرتبط «آرایشی بهداشتی و پزشکی» باعث شد رتبه‌ی اول
-    # از «تیرچه کرومیت...» درست به «بلوک لاستیکی» غلط تغییر کند). زمینه یک متن
-    # ثابت است که معمولاً یکسان روی همه‌ی سطرهای فایل اعمال می‌شود، پس نباید
-    # بتواند نتیجه‌ی سطرهایی را که واقعاً به آن ربطی ندارند خراب کند. به‌جایش،
-    # زمینه فقط بعد از بازیابی خالص core به کار می‌رود، برای تأیید یا اصلاح
-    # رتبه‌ی اول (search.ambiguity.resolve_with_context) — نه برای خودِ بازیابی.
     if mode == "smart" and engine.hybrid is not None:
         lexical_q = engine.understander.lexical_query(core)
         semantic_q = engine.understander.semantic_query(core)
@@ -152,14 +156,15 @@ def process_row(engine, mode, row):
     if not raw_results:
         return _not_found_record()
 
+    raw_results = apply_context_boost(raw_results, context_tokens)
     ranked_items = [item for item, _ in raw_results]
-
-    resolved = resolve_with_context(ranked_items, context_tokens)
-    if resolved is not None:
-        return _found_record(resolved, rtype)
 
     ambiguous, groups, top = compute_ambiguity(ranked_items, query_tokens, engine.item_tokens)
     if ambiguous:
+        resolved = resolve_ambiguous_group_by_context(top, groups, context_tokens)
+        if resolved is not None:
+            return _found_record(resolved, rtype)
+
         reps = representative_per_group(top, groups)
         lines = []
         for g in groups:

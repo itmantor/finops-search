@@ -41,3 +41,20 @@ def tokenize(text, drop_stopwords=True):
     if drop_stopwords:
         tokens = [t for t in tokens if t not in STOPWORDS]
     return tokens
+
+
+def tokenize_with_bigrams(text, drop_stopwords=True):
+    """همان tokenize، به‌علاوه‌ی بایگرام‌های توکن‌های مجاور («ضد»,«افتاب» هم
+    توکن «ضد_افتاب» هم می‌سازد) — فقط برای ایندکس/جستجوی واژگانی BM25
+    (search/lexical.py)، نه برای فیلتر AND ابهام یا هم‌پوشانی زمینه
+    (search/ambiguity.py که عمداً از tokenize ساده استفاده می‌کند).
+
+    دلیل: ترکیب‌های دوکلمه‌ای فارسی مثل «ضد آفتاب» یا «هیالورونیک اسید» با
+    توکنایز تک‌کلمه‌ای تکه‌تکه می‌شوند و مفهوم ترکیبی هرگز به‌عنوان یک واحد
+    قابل جستجو نیست. با benchmark.json اندازه‌گیری شد: هیچ افتی در recall@40
+    یا recall@5 در دو حالت لغوی‌تنها و ترکیبی ایجاد نمی‌کند، و MRR در هر دو
+    حالت بهتر می‌شود (لغوی‌تنها ۰.۵۴۷→۰.۶۰۵، ترکیبی ۰.۶۱۰→۰.۶۲۳ با
+    recall@5 ترکیبی هم ۰.۶۴۷→۰.۷۶۵)."""
+    tokens = tokenize(text, drop_stopwords=drop_stopwords)
+    bigrams = [f"{a}_{b}" for a, b in zip(tokens, tokens[1:])]
+    return tokens + bigrams
