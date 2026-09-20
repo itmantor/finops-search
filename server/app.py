@@ -23,6 +23,7 @@ import datetime
 import json
 import sys
 import threading
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -31,15 +32,41 @@ from flask import Flask, jsonify, render_template, request
 
 from common.catalog import load_catalog
 from common.config import CHECKPOINT_DIR, LOGS_DIR, OPENAI_API_KEY, PORT
+from common.textnorm import tokenize
 from search.enrichment import load_enrichment, make_lexical_text_fn
 from search.hybrid import HybridIndex
 from search.lexical import LexicalIndex
 from search.semantic import SemanticIndex
+from search.taxonomy_labels import label_for
 from search.understand import QueryUnderstander
 
 MODE_FAST = "fast"
 MODE_SMART = "smart"
-RESULT_LIMIT = 8
+
+# عمق بازیابی داخلی (هر دو حالت) در برابر عمق نمایش اولیه در کلاینت:
+# قبلاً هر دو ۸ بودند، پس یک تطابق در رتبه‌ی ۲۸ (مثل «شیر لبنیات» زیر ۷۶
+# شیرآلات صنعتی) هرگز دیده نمی‌شد. حالا ۲۰۰ مورد بازیابی و به کلاینت
+# برگردانده می‌شود؛ کلاینت فقط ۲۰ تای اول را نشان می‌دهد و بقیه را با دکمه‌ی
+# «نمایش بیشتر» بدون فراخوانی دوباره‌ی API آشکار می‌کند.
+RETRIEVE_LIMIT = 200
+DISPLAY_LIMIT = 20  # فقط برای برش لاگ؛ کلاینت مقدار خودش را دارد
+
+# تشخیص ابهام دسته‌بندی: بین ۵۰ نتیجه‌ی برتر، اگر حداقل دو گروه level1 هرکدام
+# حداقل ۳ عضو داشته باشند و بزرگ‌ترین گروه کمتر از ۷۰٪ کل باشد، یعنی نتایج
+# بین چند دسته‌ی واقعاً متفاوت پخش شده‌اند (نه یک نویز جزئی داخل یک دسته).
+#
+# «۵۰ نتیجه‌ی برتر» فقط از میان مواردی انتخاب می‌شود که همه‌ی توکن‌های
+# پرس‌وجو را دارند (AND، نه OR): BM25/RRF برای بازیابی خوب عمداً OR است
+# (هر سند حاوی حتی یک توکن امتیاز می‌گیرد)، اما همین باعث می‌شود برای
+# پرس‌وجوی دوکلمه‌ای مثل «تیرچه بلوک»، اسنادی که فقط کلمه‌ی عمومی «بلوک»
+# را دارند (مثلاً بلوک سیلندر، بلوک تغذیه) وارد ۵۰تای برتر شوند و ابهام
+# قلابی بسازند — با آزمایش مستقیم روی کاتالوگ تأیید شد: هیچ شرحی هر دو
+# توکن «تیرچه»/«بلوک» را با هم ندارد، پس فیلتر AND این مورد را کاملاً
+# حذف می‌کند، در حالی که برای «شیر» (یک توکنی) AND همان OR است و ابهام
+# واقعی (شیر لبنیات/شیرآلات صنعتی) دست‌نخورده باقی می‌ماند.
+AMBIGUITY_TOP_N = 50
+AMBIGUITY_MIN_GROUP = 3
+AMBIGUITY_MAX_SHARE = 0.7
 
 SEMANTIC_INDEX_PATH = CHECKPOINT_DIR / "catalog_semantic.index"
 SEMANTIC_POSITIONS_PATH = CHECKPOINT_DIR / "catalog_semantic_positions.npy"
@@ -51,8 +78,13 @@ _log_lock = threading.Lock()
 print("⏳ در حال بارگذاری کاتالوگ و ایندکس‌ها ...")
 
 ITEMS = load_catalog()
-ENRICHMENT = load_enrichment()  # پیکربندی انتخاب‌شده طبق بنچمارک: غنی‌سازی با examples
-LEXICAL = LexicalIndex(items=ITEMS, text_fn=make_lexical_text_fn(ENRICHMENT, include_examples=True))
+ENRICHMENT = load_enrichment(examples_source="raw")  # پیکربندی انتخاب‌شده طبق بنچمارک: غنی‌سازی با examples (پاس ۱، ۱۰۰٪ کامل — پاس ۲ رهاشده و فقط ۶.۷٪ پوشش دارد)
+LEXICAL_TEXT_FN = make_lexical_text_fn(ENRICHMENT, include_examples=True)
+LEXICAL = LexicalIndex(items=ITEMS, text_fn=LEXICAL_TEXT_FN)
+
+# توکن‌های هر شرح، از پیش محاسبه‌شده؛ فقط برای فیلتر AND در تشخیص ابهام
+# (نگاه کنید به compute_ambiguity) استفاده می‌شود، نه برای رتبه‌بندی BM25.
+ITEM_TOKENS = {item: frozenset(tokenize(LEXICAL_TEXT_FN(item))) for item in ITEMS}
 
 SEMANTIC = None
 HYBRID = None
@@ -83,7 +115,39 @@ def make_record(item, score):
         "domestic_ids": list(item.domestic_ids),
         "imported_ids": list(item.imported_ids),
         "score": score,
+        # فقط برای گروه‌بندی کلاینت هنگام ابهام؛ در نتایج عادی نمایش داده نمی‌شود.
+        "level1": item.level1,
     }
+
+
+def compute_ambiguity(ranked_items, query_tokens):
+    """تشخیص قطعی و بدون فراخوانی مدل: آیا ۵۰ نتیجه‌ی برتر بین چند دسته‌ی
+    level1 واقعاً متفاوت پخش شده‌اند؟ فقط گروه‌های حداقل ۳عضوی به‌عنوان چیپ
+    برگردانده می‌شوند (یک مورد پرت تک‌عضوی گزینه‌ی معناداری برای انتخاب نیست).
+
+    فقط مواردی در نظر گرفته می‌شوند که همه‌ی query_tokens را دارند (AND) —
+    نه هر موردی که در بازیابی OR-محور رتبه گرفته؛ دلیل را در تعریف
+    AMBIGUITY_TOP_N بالا ببینید."""
+    if query_tokens:
+        candidates = [item for item in ranked_items if query_tokens <= ITEM_TOKENS.get(item, frozenset())]
+    else:
+        candidates = ranked_items
+
+    top = candidates[:AMBIGUITY_TOP_N]
+    if not top:
+        return False, []
+
+    counts = Counter(item.level1 for item in top)
+    ordered = counts.most_common()
+    largest = ordered[0][1]
+    qualifying = [(level1, c) for level1, c in ordered if c >= AMBIGUITY_MIN_GROUP]
+
+    ambiguous = len(qualifying) >= 2 and largest < AMBIGUITY_MAX_SHARE * len(top)
+    groups = [
+        {"label": label_for(level1), "level1": level1, "count": c}
+        for level1, c in qualifying
+    ]
+    return ambiguous, groups
 
 
 def _log_search(query, mode, results):
@@ -97,7 +161,7 @@ def _log_search(query, mode, results):
                 "domestic_ids": r["domestic_ids"],
                 "imported_ids": r["imported_ids"],
             }
-            for r in results
+            for r in results[:DISPLAY_LIMIT]
         ],
     }
     try:
@@ -140,17 +204,22 @@ def search():
         try:
             lexical_query = UNDERSTANDER.lexical_query(query)
             semantic_query = UNDERSTANDER.semantic_query(query)
-            raw_results = HYBRID.search_split(lexical_query, semantic_query, k=RESULT_LIMIT)
+            raw_results = HYBRID.search_split(lexical_query, semantic_query, k=RETRIEVE_LIMIT)
+            # عبارت پاک‌شده (بدون برند/کلیدواژه‌های گسترش‌یافته) برای فیلتر AND
+            # ابهام؛ از کش UNDERSTANDER می‌آید، فراخوانی اضافه‌ای ندارد.
+            query_tokens = set(tokenize(semantic_query))
         except Exception as e:
             return jsonify({"error": f"خطا در ارتباط با OpenAI: {e}"})
     else:
         mode = MODE_FAST
-        raw_results = LEXICAL.search(query, k=RESULT_LIMIT)
+        raw_results = LEXICAL.search(query, k=RETRIEVE_LIMIT)
+        query_tokens = set(tokenize(query))
 
+    ambiguous, groups = compute_ambiguity([item for item, _ in raw_results], query_tokens)
     results = [make_record(item, pct) for item, pct in _to_scored_percent(raw_results)]
     _log_search(query, mode, results)
 
-    return jsonify({"results": results})
+    return jsonify({"results": results, "ambiguous": ambiguous, "groups": groups})
 
 
 if __name__ == "__main__":

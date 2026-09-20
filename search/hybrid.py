@@ -27,10 +27,15 @@ class HybridIndex:
         return self.search_split(query, query, k=k)
 
     def search_split(self, lexical_query, semantic_query, k=40):
-        """جستجو با پرس‌وجوی متفاوت برای هر کانال (مثلاً بعد از فهم پرس‌وجو) و ترکیب با RRF."""
+        """جستجو با پرس‌وجوی متفاوت برای هر کانال (مثلاً بعد از فهم پرس‌وجو) و ترکیب با RRF.
+
+        هر کانال حداقل k مورد برمی‌گرداند (نه فقط TOP_PER_CHANNEL ثابت)، وگرنه
+        وقتی k از TOP_PER_CHANNEL بزرگ‌تر خواسته شود (مثلاً بازیابی عمیق ۲۰۰تایی
+        سرور)، اجتماع دو کانال هرگز نمی‌تواند به k برسد."""
+        per_channel = max(TOP_PER_CHANNEL, k)
         channel_results = [
-            self.lexical.search(lexical_query, k=TOP_PER_CHANNEL),
-            self.semantic.search(semantic_query, k=TOP_PER_CHANNEL),
+            self.lexical.search(lexical_query, k=per_channel),
+            self.semantic.search(semantic_query, k=per_channel),
         ]
 
         scores = defaultdict(float)

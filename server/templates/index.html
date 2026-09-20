@@ -44,6 +44,13 @@
   .dot.ok { background:#00C896; }
   .spinner { display:inline-block; width:14px; height:14px; border:2px solid #30363D; border-top-color:#00C896; border-radius:50%; animation:spin .7s linear infinite; vertical-align:middle; }
   @keyframes spin { to { transform:rotate(360deg); } }
+  .ambiguity { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
+  .ambiguity-q { font-size:13px; color:#8B949E; }
+  .chip { background:#0D1117; border:1px solid #30363D; border-radius:999px; padding:6px 14px; font-size:13px; cursor:pointer; transition:.15s; color:#E6EDF3; }
+  .chip:hover { border-color:#00C896; }
+  .chip.active { background:rgba(0,200,150,.15); border-color:#00C896; color:#00C896; font-weight:700; }
+  .more-btn { display:block; width:100%; background:#161B22; border:1px dashed #30363D; border-radius:10px; padding:10px; text-align:center; font-size:13px; color:#8B949E; cursor:pointer; margin-top:6px; }
+  .more-btn:hover { border-color:#00C896; color:#00C896; }
 </style>
 </head>
 <body>
@@ -79,6 +86,16 @@
 <script>
 let mode = 'fast';
 let hasSmart = false;
+
+const DISPLAY_STEP = 20;
+
+// وضعیت آخرین جستجو، برای فیلتر کردن چیپ‌ها و «نمایش بیشتر» کاملاً سمت
+// کلاینت — هرگز /api/search دوباره صدا زده نمی‌شود، چون فهم پرس‌وجو و
+// Embedding هزینه دارند و پاسخ از قبل در دست است.
+let lastAll = [];      // همه‌ی نتایج بازیابی‌شده (تا ۲۰۰ مورد)
+let lastGroups = [];   // چیپ‌های ابهام (از سرور)
+let activeLevel1 = null; // null یعنی «همه»
+let shownCount = DISPLAY_STEP;
 
 const MODE_HINTS = {
   fast: 'جستجوی متنی فوری و رایگان، بدون نیاز به اتصال خارجی.',
@@ -128,7 +145,7 @@ async function doSearch() {
   const query = document.getElementById('q').value.trim();
   const results = document.getElementById('results');
   const stats = document.getElementById('stats');
-  if (!query) { results.innerHTML = ''; stats.textContent = ''; return; }
+  if (!query) { results.innerHTML = ''; stats.textContent = ''; lastAll = []; lastGroups = []; return; }
 
   stats.innerHTML = '<span class="spinner"></span> در حال جستجو...';
   results.innerHTML = '';
@@ -139,29 +156,75 @@ async function doSearch() {
       body: JSON.stringify({query, mode})
     });
     const res = await r.json();
-    if (res.error) { stats.textContent = ''; results.innerHTML = '<div class="empty">' + res.error + '</div>'; return; }
+    if (res.error) { stats.textContent = ''; results.innerHTML = '<div class="empty">' + res.error + '</div>'; lastAll = []; lastGroups = []; return; }
 
-    const matched = res.results || [];
-    stats.textContent = matched.length + ' نتیجه';
-    if (matched.length === 0) {
-      results.innerHTML = '<div class="empty">نتیجه‌ای پیدا نشد.</div>';
-      return;
-    }
-    results.innerHTML = matched.map(r => `
-      <div class="result">
-        <div class="result-desc">${r.description}</div>
-        <div class="result-ids">
-          ${idGroup('شناسه تولید داخل', r.domestic_ids)}
-          ${idGroup('شناسه وارداتی', r.imported_ids)}
-        </div>
-        <div class="result-footer">
-          <span class="result-score">تطابق ${r.score}٪</span>
-        </div>
-      </div>
-    `).join('');
+    lastAll = res.results || [];
+    lastGroups = res.ambiguous ? (res.groups || []) : [];
+    activeLevel1 = null;
+    shownCount = DISPLAY_STEP;
+    render();
   } catch (e) {
     stats.textContent = ''; results.innerHTML = '<div class="empty">خطا: ' + e + '</div>';
   }
+}
+
+function currentFiltered() {
+  return activeLevel1 === null ? lastAll : lastAll.filter(r => r.level1 === activeLevel1);
+}
+
+function render() {
+  const results = document.getElementById('results');
+  const stats = document.getElementById('stats');
+
+  if (lastAll.length === 0) {
+    stats.textContent = '';
+    results.innerHTML = '<div class="empty">نتیجه‌ای پیدا نشد.</div>';
+    return;
+  }
+
+  const filtered = currentFiltered();
+  const visible = filtered.slice(0, shownCount);
+  stats.textContent = filtered.length + ' نتیجه';
+
+  let html = '';
+  if (lastGroups.length > 0) {
+    html += '<div class="ambiguity"><span class="ambiguity-q">منظورتان کدام است؟</span>';
+    for (const g of lastGroups) {
+      html += `<span class="chip${activeLevel1 === g.level1 ? ' active' : ''}" onclick="selectChip('${g.level1.replace(/'/g, "\\'")}')">${g.label}</span>`;
+    }
+    html += `<span class="chip${activeLevel1 === null ? ' active' : ''}" onclick="selectChip(null)">همه</span>`;
+    html += '</div>';
+  }
+
+  html += visible.map(r => `
+    <div class="result">
+      <div class="result-desc">${r.description}</div>
+      <div class="result-ids">
+        ${idGroup('شناسه تولید داخل', r.domestic_ids)}
+        ${idGroup('شناسه وارداتی', r.imported_ids)}
+      </div>
+      <div class="result-footer">
+        <span class="result-score">تطابق ${r.score}٪</span>
+      </div>
+    </div>
+  `).join('');
+
+  if (filtered.length > shownCount) {
+    html += `<div class="more-btn" onclick="showMore()">نمایش بیشتر (${filtered.length - shownCount} مورد دیگر)</div>`;
+  }
+
+  results.innerHTML = html;
+}
+
+function selectChip(level1) {
+  activeLevel1 = level1;
+  shownCount = DISPLAY_STEP;
+  render();
+}
+
+function showMore() {
+  shownCount += DISPLAY_STEP;
+  render();
 }
 
 function copyId(id, el) {
