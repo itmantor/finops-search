@@ -14,9 +14,13 @@ B = 0.75
 
 
 class LexicalIndex:
-    def __init__(self, items=None, k1=K1, b=B):
+    def __init__(self, items=None, k1=K1, b=B, text_fn=None):
+        """text_fn(item) -> str متن ایندکس هر مورد را می‌سازد؛ پیش‌فرض همان item.description
+        قبلی است (بدون تغییر رفتار). برای متن غنی‌شده، یک text_fn سفارشی بده
+        (نگاه کنید به search/enrichment.py)."""
         self.items = items if items is not None else load_catalog()
-        tokenized = [tokenize(item.description) for item in self.items]
+        text_fn = text_fn or (lambda item: item.description)
+        tokenized = [tokenize(text_fn(item)) for item in self.items]
         self._bm25 = BM25Okapi(tokenized, k1=k1, b=b)
 
     def search(self, query, k=40):
