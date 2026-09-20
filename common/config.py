@@ -15,9 +15,10 @@ DATA_DIR = BASE_DIR / "data"
 CHECKPOINT_DIR = BASE_DIR / "checkpoints"
 OUTPUT_DIR = BASE_DIR / "outputs"
 LOGS_DIR = BASE_DIR / "logs"
+UPLOAD_DIR = BASE_DIR / "uploads" / "bulk"  # فایل‌های آپلودی جستجوی گروهی و نتیجه‌شان؛ هرگز در گیت نیست
 
-for _d in (DATA_DIR, CHECKPOINT_DIR, OUTPUT_DIR, LOGS_DIR):
-    _d.mkdir(exist_ok=True)
+for _d in (DATA_DIR, CHECKPOINT_DIR, OUTPUT_DIR, LOGS_DIR, UPLOAD_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "text-embedding-3-small").strip()

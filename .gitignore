@@ -8,6 +8,7 @@ data/
 outputs/
 checkpoints/
 logs/
+uploads/
 
 # هر فایل داده‌ای، هر جا که باشد
 *.csv

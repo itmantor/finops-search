@@ -21,27 +21,28 @@ import) بارگذاری می‌شوند تا با gunicorn --preload بین ه�
 """
 import datetime
 import json
+import shutil
+import subprocess
 import sys
 import threading
-from collections import Counter
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
 
-from common.catalog import load_catalog
-from common.config import CHECKPOINT_DIR, LOGS_DIR, OPENAI_API_KEY, PORT
+from common.config import LOGS_DIR, OPENAI_API_KEY, PORT, UPLOAD_DIR
 from common.textnorm import tokenize
-from search.enrichment import load_enrichment, make_lexical_text_fn
-from search.hybrid import HybridIndex
-from search.lexical import LexicalIndex
-from search.semantic import SemanticIndex
-from search.taxonomy_labels import label_for
-from search.understand import QueryUnderstander
+from pipeline.bulk_shared import RETENTION_DAYS, ValidationError, read_rows, validate_rows
+from search.ambiguity import compute_ambiguity
+from search.engine import load_engine
 
 MODE_FAST = "fast"
 MODE_SMART = "smart"
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+BULK_SCRIPT = BASE_DIR / "pipeline" / "bulk_lookup.py"
 
 # عمق بازیابی داخلی (هر دو حالت) در برابر عمق نمایش اولیه در کلاینت:
 # قبلاً هر دو ۸ بودند، پس یک تطابق در رتبه‌ی ۲۸ (مثل «شیر لبنیات» زیر ۷۶
@@ -51,25 +52,6 @@ MODE_SMART = "smart"
 RETRIEVE_LIMIT = 200
 DISPLAY_LIMIT = 20  # فقط برای برش لاگ؛ کلاینت مقدار خودش را دارد
 
-# تشخیص ابهام دسته‌بندی: بین ۵۰ نتیجه‌ی برتر، اگر حداقل دو گروه level1 هرکدام
-# حداقل ۳ عضو داشته باشند و بزرگ‌ترین گروه کمتر از ۷۰٪ کل باشد، یعنی نتایج
-# بین چند دسته‌ی واقعاً متفاوت پخش شده‌اند (نه یک نویز جزئی داخل یک دسته).
-#
-# «۵۰ نتیجه‌ی برتر» فقط از میان مواردی انتخاب می‌شود که همه‌ی توکن‌های
-# پرس‌وجو را دارند (AND، نه OR): BM25/RRF برای بازیابی خوب عمداً OR است
-# (هر سند حاوی حتی یک توکن امتیاز می‌گیرد)، اما همین باعث می‌شود برای
-# پرس‌وجوی دوکلمه‌ای مثل «تیرچه بلوک»، اسنادی که فقط کلمه‌ی عمومی «بلوک»
-# را دارند (مثلاً بلوک سیلندر، بلوک تغذیه) وارد ۵۰تای برتر شوند و ابهام
-# قلابی بسازند — با آزمایش مستقیم روی کاتالوگ تأیید شد: هیچ شرحی هر دو
-# توکن «تیرچه»/«بلوک» را با هم ندارد، پس فیلتر AND این مورد را کاملاً
-# حذف می‌کند، در حالی که برای «شیر» (یک توکنی) AND همان OR است و ابهام
-# واقعی (شیر لبنیات/شیرآلات صنعتی) دست‌نخورده باقی می‌ماند.
-AMBIGUITY_TOP_N = 50
-AMBIGUITY_MIN_GROUP = 3
-AMBIGUITY_MAX_SHARE = 0.7
-
-SEMANTIC_INDEX_PATH = CHECKPOINT_DIR / "catalog_semantic.index"
-SEMANTIC_POSITIONS_PATH = CHECKPOINT_DIR / "catalog_semantic_positions.npy"
 SEARCH_LOG_PATH = LOGS_DIR / "search_log.jsonl"
 
 app = Flask(__name__)
@@ -77,24 +59,16 @@ _log_lock = threading.Lock()
 
 print("⏳ در حال بارگذاری کاتالوگ و ایندکس‌ها ...")
 
-ITEMS = load_catalog()
-ENRICHMENT = load_enrichment(examples_source="raw")  # پیکربندی انتخاب‌شده طبق بنچمارک: غنی‌سازی با examples (پاس ۱، ۱۰۰٪ کامل — پاس ۲ رهاشده و فقط ۶.۷٪ پوشش دارد)
-LEXICAL_TEXT_FN = make_lexical_text_fn(ENRICHMENT, include_examples=True)
-LEXICAL = LexicalIndex(items=ITEMS, text_fn=LEXICAL_TEXT_FN)
+ENGINE = load_engine()
+ITEMS = ENGINE.items
+LEXICAL = ENGINE.lexical
+SEMANTIC = ENGINE.semantic
+HYBRID = ENGINE.hybrid
+UNDERSTANDER = ENGINE.understander
+ITEM_TOKENS = ENGINE.item_tokens
 
-# توکن‌های هر شرح، از پیش محاسبه‌شده؛ فقط برای فیلتر AND در تشخیص ابهام
-# (نگاه کنید به compute_ambiguity) استفاده می‌شود، نه برای رتبه‌بندی BM25.
-ITEM_TOKENS = {item: frozenset(tokenize(LEXICAL_TEXT_FN(item))) for item in ITEMS}
-
-SEMANTIC = None
-HYBRID = None
-if SEMANTIC_INDEX_PATH.exists() and SEMANTIC_POSITIONS_PATH.exists():
-    SEMANTIC = SemanticIndex.from_prebuilt(SEMANTIC_INDEX_PATH, SEMANTIC_POSITIONS_PATH, items=ITEMS)
-    HYBRID = HybridIndex(LEXICAL, SEMANTIC)
-else:
+if HYBRID is None:
     print("⚠️  ایندکس معنایی از پیش‌ساخته پیدا نشد. اجرا کنید: python pipeline/build_search_index.py")
-
-UNDERSTANDER = QueryUnderstander()
 
 print(f"✅ آماده — {len(ITEMS):,} شرح یکتا بارگذاری شد.")
 
@@ -118,36 +92,6 @@ def make_record(item, score):
         # فقط برای گروه‌بندی کلاینت هنگام ابهام؛ در نتایج عادی نمایش داده نمی‌شود.
         "level1": item.level1,
     }
-
-
-def compute_ambiguity(ranked_items, query_tokens):
-    """تشخیص قطعی و بدون فراخوانی مدل: آیا ۵۰ نتیجه‌ی برتر بین چند دسته‌ی
-    level1 واقعاً متفاوت پخش شده‌اند؟ فقط گروه‌های حداقل ۳عضوی به‌عنوان چیپ
-    برگردانده می‌شوند (یک مورد پرت تک‌عضوی گزینه‌ی معناداری برای انتخاب نیست).
-
-    فقط مواردی در نظر گرفته می‌شوند که همه‌ی query_tokens را دارند (AND) —
-    نه هر موردی که در بازیابی OR-محور رتبه گرفته؛ دلیل را در تعریف
-    AMBIGUITY_TOP_N بالا ببینید."""
-    if query_tokens:
-        candidates = [item for item in ranked_items if query_tokens <= ITEM_TOKENS.get(item, frozenset())]
-    else:
-        candidates = ranked_items
-
-    top = candidates[:AMBIGUITY_TOP_N]
-    if not top:
-        return False, []
-
-    counts = Counter(item.level1 for item in top)
-    ordered = counts.most_common()
-    largest = ordered[0][1]
-    qualifying = [(level1, c) for level1, c in ordered if c >= AMBIGUITY_MIN_GROUP]
-
-    ambiguous = len(qualifying) >= 2 and largest < AMBIGUITY_MAX_SHARE * len(top)
-    groups = [
-        {"label": label_for(level1), "level1": level1, "count": c}
-        for level1, c in qualifying
-    ]
-    return ambiguous, groups
 
 
 def _log_search(query, mode, results):
@@ -215,11 +159,160 @@ def search():
         raw_results = LEXICAL.search(query, k=RETRIEVE_LIMIT)
         query_tokens = set(tokenize(query))
 
-    ambiguous, groups = compute_ambiguity([item for item, _ in raw_results], query_tokens)
+    ambiguous, groups, _top = compute_ambiguity([item for item, _ in raw_results], query_tokens, ITEM_TOKENS)
     results = [make_record(item, pct) for item, pct in _to_scored_percent(raw_results)]
     _log_search(query, mode, results)
 
     return jsonify({"results": results, "ambiguous": ambiguous, "groups": groups})
+
+
+# ------------------------------------------------------------ جستجوی گروهی
+
+def _cleanup_old_jobs():
+    """پاکسازی فرصت‌طلبانه: هر job قدیمی‌تر از RETENTION_DAYS روز حذف می‌شود.
+    هنگام هر آپلود تازه اجرا می‌شود؛ بدون نیاز به cron یا سرویس جدا."""
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=RETENTION_DAYS)
+    if not UPLOAD_DIR.exists():
+        return
+    for job_dir in UPLOAD_DIR.iterdir():
+        status_path = job_dir / "status.json"
+        try:
+            with open(status_path, encoding="utf-8") as f:
+                created_at = datetime.datetime.fromisoformat(json.load(f)["created_at"])
+            if created_at < cutoff:
+                shutil.rmtree(job_dir, ignore_errors=True)
+        except Exception:
+            continue
+
+
+def _job_dir(job_id):
+    # جلوگیری از path traversal: job_id همیشه یک uuid.hex ساده است.
+    if not job_id or not job_id.isalnum():
+        return None
+    d = UPLOAD_DIR / job_id
+    return d if d.is_dir() else None
+
+
+@app.route("/api/bulk/template")
+def bulk_template():
+    from pipeline.bulk_template import build_template_workbook
+    buf = build_template_workbook()
+    return send_file(
+        buf,
+        as_attachment=True,
+        download_name="قالب_جستجوی_گروهی.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.route("/api/bulk/prepare", methods=["POST"])
+def bulk_prepare():
+    _cleanup_old_jobs()
+
+    f = request.files.get("file")
+    if f is None or not f.filename:
+        return jsonify({"error": "فایلی انتخاب نشده است."}), 400
+
+    ext = Path(f.filename).suffix.lower()
+    if ext not in (".xlsx", ".csv"):
+        return jsonify({"error": f"پسوند «{ext}» پشتیبانی نمی‌شود؛ فقط xlsx. و csv. مجاز است."}), 400
+
+    job_id = uuid.uuid4().hex
+    job_dir = UPLOAD_DIR / job_id
+    job_dir.mkdir(parents=True)
+    input_filename = f"input{ext}"
+    f.save(job_dir / input_filename)
+
+    try:
+        headers, rows = read_rows(job_dir / input_filename)
+        validate_rows(headers, rows)
+    except ValidationError as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return jsonify({"error": f"خطا در خواندن فایل: {e}"}), 400
+
+    status = {
+        "job_id": job_id,
+        "original_filename": f.filename,
+        "input_filename": input_filename,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "status": "staged",
+        "row_count": len(rows),
+        "processed": 0,
+        "mode": None,
+        "error": None,
+        "result_filename": None,
+    }
+    with open(job_dir / "status.json", "w", encoding="utf-8") as fp:
+        json.dump(status, fp, ensure_ascii=False, indent=2)
+
+    return jsonify({"job_id": job_id, "row_count": len(rows)})
+
+
+@app.route("/api/bulk/start", methods=["POST"])
+def bulk_start():
+    payload = request.get_json(force=True, silent=True) or {}
+    job_dir = _job_dir(payload.get("job_id"))
+    mode = payload.get("mode") or MODE_SMART
+
+    if job_dir is None:
+        return jsonify({"error": "این job پیدا نشد؛ شاید فایل را دوباره باید آپلود کنید."}), 404
+    if mode not in (MODE_FAST, MODE_SMART):
+        return jsonify({"error": "حالت نامعتبر است."}), 400
+    if mode == MODE_SMART and not OPENAI_API_KEY:
+        return jsonify({"error": "برای «هوشمند»، کلید OpenAI در .env لازم است."}), 400
+
+    status_path = job_dir / "status.json"
+    with open(status_path, encoding="utf-8") as fp:
+        status = json.load(fp)
+    if status["status"] != "staged":
+        return jsonify({"error": f"این job قبلاً شروع شده (وضعیت: {status['status']})."}), 400
+
+    status["mode"] = mode
+    status["status"] = "queued"
+    with open(status_path, "w", encoding="utf-8") as fp:
+        json.dump(status, fp, ensure_ascii=False, indent=2)
+
+    log_path = job_dir / "log.txt"
+    with open(log_path, "w", encoding="utf-8") as logf:
+        subprocess.Popen(
+            [sys.executable, str(BULK_SCRIPT), str(job_dir)],
+            cwd=str(BASE_DIR), stdout=logf, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+    return jsonify({"status": "queued"})
+
+
+@app.route("/api/bulk/status/<job_id>")
+def bulk_status(job_id):
+    job_dir = _job_dir(job_id)
+    if job_dir is None:
+        return jsonify({"error": "این job پیدا نشد."}), 404
+    with open(job_dir / "status.json", encoding="utf-8") as fp:
+        return jsonify(json.load(fp))
+
+
+@app.route("/api/bulk/result/<job_id>")
+def bulk_result(job_id):
+    job_dir = _job_dir(job_id)
+    if job_dir is None:
+        return jsonify({"error": "این job پیدا نشد."}), 404
+    with open(job_dir / "status.json", encoding="utf-8") as fp:
+        status = json.load(fp)
+    if status["status"] != "done":
+        return jsonify({"error": f"هنوز آماده نیست (وضعیت: {status['status']})."}), 400
+
+    original_stem = Path(status["original_filename"]).stem
+    download_name = f"نتیجه_{original_stem}.xlsx"
+    return send_file(
+        job_dir / status["result_filename"],
+        as_attachment=True,
+        download_name=download_name,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 
 if __name__ == "__main__":

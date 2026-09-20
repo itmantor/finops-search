@@ -20,6 +20,7 @@ import numpy as np
 
 from common.catalog import load_catalog
 from common.config import CHECKPOINT_DIR, EMBED_MODEL, OPENAI_API_KEY
+from common.utils import with_retry
 
 EMBEDDINGS_PATH = CHECKPOINT_DIR / "catalog_embeddings.jsonl"
 
@@ -91,7 +92,10 @@ class SemanticIndex:
             from openai import OpenAI
             self._client = OpenAI(api_key=OPENAI_API_KEY)
 
-        resp = self._client.embeddings.create(model=EMBED_MODEL, input=[query])
+        def call():
+            return self._client.embeddings.create(model=EMBED_MODEL, input=[query])
+
+        resp = with_retry(call)
         vec = np.asarray([resp.data[0].embedding], dtype="float32")
         faiss.normalize_L2(vec)
         self._query_cache[query] = vec
