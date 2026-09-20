@@ -23,13 +23,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from common.config import OPENAI_API_KEY
 from common.textnorm import tokenize
-from search.ambiguity import compute_ambiguity, representative_per_group
+from search.ambiguity import compute_ambiguity, representative_per_group, resolve_with_context
 from search.engine import load_engine
 from search.taxonomy_labels import label_for
 
 from pipeline.bulk_shared import (
     COL_BRAND, COL_CATEGORY_HINT, COL_DESC, COL_NOTES, COL_OUT_CATEGORY,
-    COL_OUT_CONFIDENCE, COL_OUT_ID, COL_OUT_OFFICIAL_DESC, COL_OUT_OTHER_OPTIONS,
+    COL_OUT_ID, COL_OUT_OFFICIAL_DESC, COL_OUT_OTHER_OPTIONS,
     COL_OUT_STATUS, COL_OUT_USER_CHOICE, COL_TYPE, STATUS_FOUND,
     STATUS_NOT_FOUND, STATUS_REVIEW, TYPE_DOMESTIC, TYPE_IMPORTED, VALID_TYPES,
     output_header_order, read_rows, write_result_xlsx,
@@ -52,20 +52,30 @@ def save_status(job_dir, status):
     tmp.replace(job_dir / "status.json")
 
 
-def build_query_text(row):
-    """شرح + برند-زدایی قطعی (نه حدسی) + دسته/توضیحات تکمیلی برای رفع ابهام."""
+def build_core_text(row):
+    """شرح کالا با برند-زدایی قطعی (نه حدسی، چون برندها هرگز در کاتالوگ نیستند)."""
     desc = (row.get(COL_DESC) or "").strip()
     brand = (row.get(COL_BRAND) or "").strip()
     if brand:
         desc = desc.replace(brand, " ")
         desc = re.sub(r"\s+", " ", desc).strip()
+    return desc
 
-    extra = " ".join(
+
+def build_context_text(row):
+    """دسته کالا + توضیحات بیشتر — زمینه‌ی جانبی برای رفع ابهام (نه بخشی از خود شرح)."""
+    return " ".join(
         (row.get(col) or "").strip()
         for col in (COL_CATEGORY_HINT, COL_NOTES)
         if (row.get(col) or "").strip()
     )
-    return f"{desc} {extra}".strip()
+
+
+def build_query_text(row):
+    """متنی که به فهم پرس‌وجو فرستاده می‌شود: شرح(برند-زدوده) + زمینه، هم‌جا."""
+    core = build_core_text(row)
+    context = build_context_text(row)
+    return f"{core} {context}".strip()
 
 
 def row_type(row):
@@ -81,50 +91,74 @@ def pick_ids(item, rtype):
     return list(item.domestic_ids) + list(item.imported_ids)
 
 
-def confidence_pct(raw_results):
-    """هرچه فاصله‌ی امتیاز رتبه‌ی ۱ با رتبه‌ی ۲ بیشتر باشد، اطمینان بالاتر —
-    بدون فراخوانی مدل، فقط از شکاف امتیاز بازیابی که از قبل محاسبه شده."""
-    if not raw_results:
-        return 0
-    top_score = raw_results[0][1]
-    if top_score <= 0:
-        return 0
-    second_score = raw_results[1][1] if len(raw_results) > 1 else 0.0
-    margin = max(0.0, 1 - (second_score / top_score))
-    return round(margin * 100)
+def _found_record(item, rtype):
+    return {
+        COL_OUT_ID: "، ".join(pick_ids(item, rtype)),
+        COL_OUT_OFFICIAL_DESC: item.description,
+        COL_OUT_CATEGORY: label_for(item.level1),
+        COL_OUT_OTHER_OPTIONS: "",
+        COL_OUT_STATUS: STATUS_FOUND,
+    }
+
+
+def _not_found_record():
+    return {
+        COL_OUT_ID: "", COL_OUT_OFFICIAL_DESC: "", COL_OUT_CATEGORY: "",
+        COL_OUT_OTHER_OPTIONS: "", COL_OUT_STATUS: STATUS_NOT_FOUND,
+    }
 
 
 def process_row(engine, mode, row):
     """جستجوی واقعی یک ردیف (۱ یا ۲ فراخوانی API در حالت هوشمند). فقط برای
-    ردیف‌هایی صدا زده می‌شود که قبلاً نتیجه‌ی قطعی نداشته‌اند."""
-    query_text = build_query_text(row)
+    ردیف‌هایی صدا زده می‌شود که قبلاً نتیجه‌ی قطعی نداشته‌اند.
+
+    شرح(core) و زمینه(دسته کالا/توضیحات بیشتر) دو نقش کاملاً جدا دارند:
+    - core (شرح با برند-زدایی قطعی) تنها چیزی است که به فهم پرس‌وجو/بازیابی
+      داده می‌شود و فیلتر AND ابهام را می‌سازد.
+    - زمینه هرگز وارد بازیابی نمی‌شود (چرا: در پایین process_row توضیح داده
+      شده)؛ فقط بعد از بازیابی، مستقل از این‌که ابهام تشخیص داده شده یا نه،
+      رتبه‌ی اول را تأیید یا اصلاح می‌کند (search.ambiguity.resolve_with_context؛
+      دلیل مستقل‌بودن از پرچم ابهام آنجا توضیح داده شده — خلاصه: بعضی جواب‌های
+      غلط اصلاً «مبهم» تشخیص داده نمی‌شوند، فقط با اطمینان اشتباه‌اند).
+    """
+    core = build_core_text(row)
+    context = build_context_text(row)
     rtype = row_type(row)
-    raw_tokens = set(tokenize(query_text))
+    core_tokens = set(tokenize(core))
+    context_tokens = set(tokenize(context))
 
-    if not raw_tokens:
-        return {
-            COL_OUT_ID: "", COL_OUT_OFFICIAL_DESC: "", COL_OUT_CATEGORY: "",
-            COL_OUT_CONFIDENCE: "", COL_OUT_OTHER_OPTIONS: "", COL_OUT_STATUS: STATUS_NOT_FOUND,
-        }
+    if not core_tokens:
+        return _not_found_record()
 
+    # فهم پرس‌وجو فقط روی core اجرا می‌شود، نه core+context هم‌جا: با آزمایش
+    # مستقیم تأیید شد که اگر زمینه هم داخل متنی برود که به مدل داده می‌شود، مدل
+    # کلماتِ زمینه را وارد keywords خودش می‌کند و همین BM25/RRF را به‌سمت زمینه
+    # منحرف می‌کند — حتی برای سطرهایی که واقعاً به آن دسته تعلق ندارند (مثلاً
+    # «تیرچه بلوک» + زمینه‌ی نامرتبط «آرایشی بهداشتی و پزشکی» باعث شد رتبه‌ی اول
+    # از «تیرچه کرومیت...» درست به «بلوک لاستیکی» غلط تغییر کند). زمینه یک متن
+    # ثابت است که معمولاً یکسان روی همه‌ی سطرهای فایل اعمال می‌شود، پس نباید
+    # بتواند نتیجه‌ی سطرهایی را که واقعاً به آن ربطی ندارند خراب کند. به‌جایش،
+    # زمینه فقط بعد از بازیابی خالص core به کار می‌رود، برای تأیید یا اصلاح
+    # رتبه‌ی اول (search.ambiguity.resolve_with_context) — نه برای خودِ بازیابی.
     if mode == "smart" and engine.hybrid is not None:
-        lexical_q = engine.understander.lexical_query(query_text)
-        semantic_q = engine.understander.semantic_query(query_text)
+        lexical_q = engine.understander.lexical_query(core)
+        semantic_q = engine.understander.semantic_query(core)
         raw_results = engine.hybrid.search_split(lexical_q, semantic_q, k=RETRIEVE_LIMIT)
-        query_tokens = set(tokenize(semantic_q))
+        query_tokens = set(tokenize(semantic_q)) or core_tokens
     else:
-        raw_results = engine.lexical.search(query_text, k=RETRIEVE_LIMIT)
-        query_tokens = raw_tokens
+        raw_results = engine.lexical.search(core, k=RETRIEVE_LIMIT)
+        query_tokens = core_tokens
 
     if not raw_results:
-        return {
-            COL_OUT_ID: "", COL_OUT_OFFICIAL_DESC: "", COL_OUT_CATEGORY: "",
-            COL_OUT_CONFIDENCE: "", COL_OUT_OTHER_OPTIONS: "", COL_OUT_STATUS: STATUS_NOT_FOUND,
-        }
+        return _not_found_record()
 
     ranked_items = [item for item, _ in raw_results]
-    ambiguous, groups, top = compute_ambiguity(ranked_items, query_tokens, engine.item_tokens)
 
+    resolved = resolve_with_context(ranked_items, context_tokens)
+    if resolved is not None:
+        return _found_record(resolved, rtype)
+
+    ambiguous, groups, top = compute_ambiguity(ranked_items, query_tokens, engine.item_tokens)
     if ambiguous:
         reps = representative_per_group(top, groups)
         lines = []
@@ -136,18 +170,10 @@ def process_row(engine, mode, row):
             lines.append(f"{g['label']}{OPTION_SEP}{item.description}{OPTION_SEP}{'، '.join(ids)}")
         return {
             COL_OUT_ID: "", COL_OUT_OFFICIAL_DESC: "", COL_OUT_CATEGORY: "",
-            COL_OUT_CONFIDENCE: "", COL_OUT_OTHER_OPTIONS: "\n".join(lines), COL_OUT_STATUS: STATUS_REVIEW,
+            COL_OUT_OTHER_OPTIONS: "\n".join(lines), COL_OUT_STATUS: STATUS_REVIEW,
         }
 
-    top_item = ranked_items[0]
-    return {
-        COL_OUT_ID: "، ".join(pick_ids(top_item, rtype)),
-        COL_OUT_OFFICIAL_DESC: top_item.description,
-        COL_OUT_CATEGORY: label_for(top_item.level1),
-        COL_OUT_CONFIDENCE: confidence_pct(raw_results),
-        COL_OUT_OTHER_OPTIONS: "",
-        COL_OUT_STATUS: STATUS_FOUND,
-    }
+    return _found_record(ranked_items[0], rtype)
 
 
 def resolve_from_user_choice(row):
@@ -179,7 +205,6 @@ def resolve_from_user_choice(row):
         COL_OUT_ID: ids,
         COL_OUT_OFFICIAL_DESC: desc,
         COL_OUT_CATEGORY: label,
-        COL_OUT_CONFIDENCE: 100,
         COL_OUT_OTHER_OPTIONS: "",
         COL_OUT_STATUS: STATUS_FOUND,
     }

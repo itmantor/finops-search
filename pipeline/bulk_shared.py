@@ -35,14 +35,17 @@ VALID_TYPES = {TYPE_IMPORTED, TYPE_DOMESTIC}
 COL_OUT_ID = "شناسه کالا"
 COL_OUT_OFFICIAL_DESC = "شرح رسمی شناسه"
 COL_OUT_CATEGORY = "دسته"
-COL_OUT_CONFIDENCE = "درصد اطمینان"
 COL_OUT_OTHER_OPTIONS = "گزینه‌های دیگر"
 COL_OUT_STATUS = "وضعیت"
 COL_OUT_USER_CHOICE = "انتخاب شما"
 
+# «درصد اطمینان» عمداً حذف شد: مقدارش امتیاز خام RRF/BM25 بود، نه یک اطمینان
+# کالیبره‌شده، و بین پرس‌وجوهای مختلف قابل مقایسه نبود — یک ستون با این عنوان
+# کاربر را گمراه می‌کرد. «وضعیت» (یافت شد/نیاز به بررسی/یافت نشد) سیگنال واقعی
+# را می‌دهد.
 OUTPUT_COLUMNS = [
     COL_OUT_ID, COL_OUT_OFFICIAL_DESC, COL_OUT_CATEGORY,
-    COL_OUT_CONFIDENCE, COL_OUT_OTHER_OPTIONS, COL_OUT_STATUS, COL_OUT_USER_CHOICE,
+    COL_OUT_OTHER_OPTIONS, COL_OUT_STATUS, COL_OUT_USER_CHOICE,
 ]
 
 STATUS_FOUND = "یافت شد"

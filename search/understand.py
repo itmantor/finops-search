@@ -71,6 +71,7 @@ class QueryUnderstander:
                     {"role": "user", "content": query},
                 ],
                 response_format={"type": "json_object"},
+                temperature=0,
             )
 
         resp = with_retry(call)
