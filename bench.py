@@ -10,6 +10,12 @@ benchmark.json را می‌خواند، هر پرس‌وجو را با یک یا
 عبور می‌کند: کانال واژگانی عبارت پاک‌شده + کلیدواژه‌ها را می‌گیرد (شبکه‌ی
 توکن گسترده برای BM25) و کانال معنایی فقط عبارت پاک‌شده را (یک بردار
 یکپارچه، بدون رقیق‌شدن).
+
+با پرچم --enriched {no-examples,with-examples,all}، متن ایندکس از
+pipeline/enrich_catalog.py (canonical/synonyms/examples/uses) استفاده
+می‌کند (نگاه کنید به search/enrichment.py). --enriched all هر سه حالت
+(none / no-examples / with-examples) را کنار هم مقایسه می‌کند تا مشخص
+شود آیا examples واقعاً کمک می‌کند یا فقط نویز/ریسک اضافه می‌کند.
 """
 import argparse
 import json
@@ -23,6 +29,12 @@ TOP_K_STRICT = 5
 SHOW_ON_FAIL = 5
 
 MODES = ["lexical", "semantic", "hybrid"]
+ENRICH_STATES = ["none", "no-examples", "with-examples"]
+ENRICH_LABELS = {
+    "none": "بدون غنی‌سازی",
+    "no-examples": "غنی‌سازی بدون examples",
+    "with-examples": "غنی‌سازی با examples",
+}
 
 
 def find_rank(results, expected_descriptions):
@@ -34,25 +46,66 @@ def find_rank(results, expected_descriptions):
     return None, None
 
 
-def build_indices(modes):
-    """ساخت فقط ایندکس‌های لازم؛ semantic بین حالت semantic و hybrid مشترک است."""
+def build_indices(mode_state_pairs, examples_source="reviewed"):
+    """ساخت فقط ایندکس‌های لازم برای مجموعه‌ای از جفت‌های (mode, enrich_state).
+
+    dict برگشتی با کلید (mode, state) پر می‌شود. برای state != "none"، متن
+    واژگانی از search/enrichment.py ساخته می‌شود و کانال معنایی از بردارهای
+    غنی‌شده‌ی جداگانه (checkpoints/catalog_embeddings_enriched.jsonl) استفاده
+    می‌کند — این فایل هرگز بردارهای اصلی را جای‌گزین نمی‌کند.
+    هر دو حالت no-examples و with-examples از همان بردار معنایی مشترک
+    استفاده می‌کنند (چون متن معنایی فقط description+canonical است و examples
+    اصلاً در کانال معنایی دخیل نیست)؛ پس فقط یک بار Embedding غنی‌شده لود می‌شود.
+    """
+    needed_states = {state for _, state in mode_state_pairs}
+    enrichment = None
+    if needed_states - {"none"}:
+        from search.enrichment import load_enrichment
+        enrichment = load_enrichment(examples_source=examples_source)
+
+    lexical_cache = {}
+    semantic_cache = {}
+    hybrid_cache = {}
+
+    def semantic_variant(state):
+        return "none" if state == "none" else "enriched"
+
+    def get_lexical(state):
+        if state not in lexical_cache:
+            from search.lexical import LexicalIndex
+            if state == "none":
+                lexical_cache[state] = LexicalIndex()
+            else:
+                from search.enrichment import make_lexical_text_fn
+                include_examples = state == "with-examples"
+                lexical_cache[state] = LexicalIndex(
+                    text_fn=make_lexical_text_fn(enrichment, include_examples)
+                )
+        return lexical_cache[state]
+
+    def get_semantic(state):
+        variant = semantic_variant(state)
+        if variant not in semantic_cache:
+            from search.semantic import SemanticIndex
+            if variant == "none":
+                semantic_cache[variant] = SemanticIndex()
+            else:
+                from common.config import CHECKPOINT_DIR
+                path = CHECKPOINT_DIR / "catalog_embeddings_enriched.jsonl"
+                semantic_cache[variant] = SemanticIndex(embeddings_path=path)
+        return semantic_cache[variant]
+
     indices = {}
-    lexical_index = None
-    semantic_index = None
-
-    if "lexical" in modes or "hybrid" in modes:
-        from search.lexical import LexicalIndex
-        lexical_index = LexicalIndex()
-        indices["lexical"] = lexical_index
-
-    if "semantic" in modes or "hybrid" in modes:
-        from search.semantic import SemanticIndex
-        semantic_index = SemanticIndex()
-        indices["semantic"] = semantic_index
-
-    if "hybrid" in modes:
-        from search.hybrid import HybridIndex
-        indices["hybrid"] = HybridIndex(lexical_index, semantic_index)
+    for mode, state in mode_state_pairs:
+        if mode == "lexical":
+            indices[(mode, state)] = get_lexical(state)
+        elif mode == "semantic":
+            indices[(mode, state)] = get_semantic(state)
+        elif mode == "hybrid":
+            if state not in hybrid_cache:
+                from search.hybrid import HybridIndex
+                hybrid_cache[state] = HybridIndex(get_lexical(state), get_semantic(state))
+            indices[(mode, state)] = hybrid_cache[state]
 
     return indices
 
@@ -165,9 +218,14 @@ def main():
     parser.add_argument("--all", action="store_true", help="اجرای هر سه حالت و چاپ جدول مقایسه")
     parser.add_argument("--understand", action="store_true",
                          help="عبور پرس‌وجو از فهم پرس‌وجو (search/understand.py) پیش از بازیابی")
+    parser.add_argument("--enriched", choices=ENRICH_STATES + ["all"], default="none",
+                         help="متن ایندکس از غنی‌سازی کاتالوگ استفاده کند؛ all هر سه حالت را مقایسه می‌کند")
+    parser.add_argument("--examples-source", choices=["reviewed", "raw"], default="reviewed",
+                         help="reviewed: examples پاس ۲ (بازبینی‌شده)؛ raw: examples_raw پاس ۱ (بدون بازبینی، برای همه‌ی شرح‌ها)")
     args = parser.parse_args()
 
     modes = MODES if args.all else [args.mode]
+    enrich_states = ENRICH_STATES if args.enriched == "all" else [args.enriched]
 
     with open(BENCHMARK_PATH, encoding="utf-8") as f:
         benchmark = json.load(f)
@@ -179,28 +237,35 @@ def main():
         understander = QueryUnderstander()
         print_understanding(cases, understander)
 
+    # با --all --understand، هر حالت هم بدون و هم با فهم پرس‌وجو اجرا می‌شود.
+    if args.all and args.understand:
+        understand_variants = [(None, "بدون فهم"), (understander, "با فهم")]
+    else:
+        understand_variants = [(understander, "با فهم" if args.understand else None)]
+
+    variants = []  # (mode, state, understander, label)
+    show_state_label = len(enrich_states) > 1 or args.enriched != "none"
+    for mode in modes:
+        for state in enrich_states:
+            for u, u_label in understand_variants:
+                label_bits = [mode]
+                if show_state_label:
+                    label_bits.append(f"[{ENRICH_LABELS[state]}]")
+                if u_label:
+                    label_bits.append(f"({u_label})")
+                variants.append((mode, state, u, " ".join(label_bits)))
+
     print("در حال ساخت ایندکس(ها)...")
-    indices = build_indices(modes)
+    mode_state_pairs = {(mode, state) for mode, state, _, _ in variants}
+    indices = build_indices(mode_state_pairs, examples_source=args.examples_source)
     print("ایندکس(ها) آماده شد.\n")
 
-    # با --all --understand، برای هر حالت هم بدون و هم با فهم پرس‌وجو اجرا می‌شود
-    # (۶ ردیف مقایسه)؛ در غیر این صورت فقط با/بدون فهم بسته به --understand.
-    variants = []
-    if args.all and args.understand:
-        for mode in modes:
-            variants.append((mode, f"{mode} (بدون فهم)", None))
-            variants.append((mode, f"{mode} (با فهم)", understander))
-    else:
-        for mode in modes:
-            label = f"{mode} (با فهم)" if args.understand else mode
-            variants.append((mode, label, understander))
-
     all_stats = {}
-    for mode, label, u in variants:
-        search_fn = make_search_fn(mode, indices[mode], u)
+    for mode, state, u, label in variants:
+        search_fn = make_search_fn(mode, indices[(mode, state)], u)
         all_stats[label] = run_mode(label, search_fn, cases)
 
-    if args.all:
+    if args.all or len(variants) > 1:
         print_comparison(all_stats)
 
 
