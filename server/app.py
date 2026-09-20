@@ -21,6 +21,7 @@ import) بارگذاری می‌شوند تا با gunicorn --preload بین ه�
 """
 import datetime
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,39 @@ MODE_SMART = "smart"
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 BULK_SCRIPT = BASE_DIR / "pipeline" / "bulk_lookup.py"
+
+# نسخه‌ای که دستی هنگام هر تغییر معنادار بالا برده می‌شود؛ commit/commit_date
+# خودکار از گیت خوانده می‌شوند، started_at هنگام import همین ماژول (یک‌بار،
+# در پردازه‌ی master با gunicorn --preload) ثبت می‌شود — دقیقاً همان چیزی که
+# نشان می‌دهد آیا سرویس واقعاً بعد از آخرین deploy ری‌استارت شده یا نه.
+VERSION = "1.0.0"
+
+
+def _git_info():
+    """هش کوتاه و تاریخ آخرین commit؛ اگر گیت در دسترس نبود (مثلاً روی سرور
+    تولید بدون .git)، بدون کرش‌کردن سرور None برمی‌گرداند.
+
+    سرویس systemd این اپ عمداً PATH را به venv/bin محدود می‌کند (deploy/
+    finops-search.service)، پس git با نام ساده در آن پیدا نمی‌شود؛ مسیرهای
+    معمول سیستم را صریحاً به PATH پردازه‌ی فرزند اضافه می‌کنیم."""
+    env = dict(os.environ)
+    env["PATH"] = env.get("PATH", "") + os.pathsep + "/usr/bin:/usr/local/bin:/bin"
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(BASE_DIR), stderr=subprocess.DEVNULL, timeout=5, env=env,
+        ).decode().strip()
+        commit_date = subprocess.check_output(
+            ["git", "log", "-1", "--format=%cI"],
+            cwd=str(BASE_DIR), stderr=subprocess.DEVNULL, timeout=5, env=env,
+        ).decode().strip()
+        return commit or None, commit_date or None
+    except Exception:
+        return None, None
+
+
+COMMIT_HASH, COMMIT_DATE = _git_info()
+STARTED_AT = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 # عمق بازیابی داخلی (هر دو حالت) در برابر عمق نمایش اولیه در کلاینت:
 # قبلاً هر دو ۸ بودند، پس یک تطابق در رتبه‌ی ۲۸ (مثل «شیر لبنیات» زیر ۷۶
@@ -128,6 +162,10 @@ def status():
         "record_count": len(ITEMS),
         "has_smart": HYBRID is not None and bool(OPENAI_API_KEY),
         "has_api_key": bool(OPENAI_API_KEY),
+        "version": VERSION,
+        "commit": COMMIT_HASH,
+        "commit_date": COMMIT_DATE,
+        "started_at": STARTED_AT,
     })
 
 

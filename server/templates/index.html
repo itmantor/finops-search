@@ -71,6 +71,7 @@
   .bulk-progress-bar { background:#00C896; height:100%; width:0%; transition:width .3s; }
   .bulk-progress-text { font-size:12px; color:#8B949E; text-align:center; }
   .bulk-done-text { font-size:13px; color:#00C896; margin-bottom:10px; }
+  .version-box { position:fixed; bottom:10px; left:10px; font-size:11px; color:#6E7681; background:rgba(22,27,34,.7); border:1px solid #30363D; border-radius:6px; padding:4px 9px; pointer-events:none; z-index:10; }
 </style>
 </head>
 <body>
@@ -111,6 +112,8 @@
   </div>
 </div>
 
+<div class="version-box" id="versionBox"></div>
+
 <script>
 let mode = 'fast';
 let hasSmart = false;
@@ -140,9 +143,28 @@ async function refreshStatus() {
     setDot('dotKey', 'statKey', hasSmart,
       hasSmart ? 'جستجوی هوشمند در دسترس است' : 'جستجوی هوشمند در دسترس نیست (کلید OpenAI یا ایندکس معنایی تنظیم نشده)');
     document.getElementById('tabSmart').classList.toggle('disabled', !hasSmart);
+    renderVersionBox(s);
   } catch (e) {
     document.getElementById('statFile').textContent = 'خطا در ارتباط با سرور';
   }
+}
+
+const PERSIAN_DIGITS = ['۰','۱','۲','۳','۴','۵','۶','۷','۸','۹'];
+function toPersianDigits(s) {
+  return String(s).replace(/[0-9]/g, d => PERSIAN_DIGITS[d]);
+}
+
+function renderVersionBox(s) {
+  const box = document.getElementById('versionBox');
+  const version = s.version ? toPersianDigits(s.version) : '؟';
+  const commit = s.commit || 'نامشخص';
+  const commitDate = s.commit_date
+    ? new Date(s.commit_date).toLocaleDateString('fa-IR', { year: 'numeric', month: '2-digit', day: '2-digit' })
+    : 'نامشخص';
+  const startedAt = s.started_at
+    ? new Date(s.started_at).toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' })
+    : 'نامشخص';
+  box.textContent = `نسخه ${version} · کامیت ${commit} · ${commitDate} · اجرا از ${startedAt}`;
 }
 
 function setDot(dotId, statId, ok, text) {
