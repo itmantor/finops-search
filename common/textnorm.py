@@ -43,6 +43,9 @@ def tokenize(text, drop_stopwords=True):
     return tokens
 
 
+NEGATION_PREFIXES = {"ضد", "بدون", "غیر"}
+
+
 def tokenize_with_bigrams(text, drop_stopwords=True):
     """همان tokenize، به‌علاوه‌ی بایگرام‌های توکن‌های مجاور («ضد»,«افتاب» هم
     توکن «ضد_افتاب» هم می‌سازد) — فقط برای ایندکس/جستجوی واژگانی BM25
@@ -54,7 +57,22 @@ def tokenize_with_bigrams(text, drop_stopwords=True):
     قابل جستجو نیست. با benchmark.json اندازه‌گیری شد: هیچ افتی در recall@40
     یا recall@5 در دو حالت لغوی‌تنها و ترکیبی ایجاد نمی‌کند، و MRR در هر دو
     حالت بهتر می‌شود (لغوی‌تنها ۰.۵۴۷→۰.۶۰۵، ترکیبی ۰.۶۱۰→۰.۶۲۳ با
-    recall@5 ترکیبی هم ۰.۶۴۷→۰.۷۶۵)."""
+    recall@5 ترکیبی هم ۰.۶۴۷→۰.۷۶۵).
+
+    نکته‌ی حیاتی درباره‌ی نفی (ضد/بدون/غیر): صرفاً افزودن بایگرام کافی نیست،
+    چون توکن تنهای بعد از این پیشوندها هم‌چنان در فهرست باقی می‌ماند و با
+    معنای وارونه‌اش تطبیق می‌خورد — «ضد آفتاب» با توکن تنهای «افتاب» به یک
+    آفتاب‌پرست (موجود زنده) هم‌پوشانی پیدا می‌کرد، که دقیقاً برعکسِ معنای
+    «ضد آفتاب» است. برای این پیشوندها، توکن تنهای اسم بعدی سرکوب می‌شود (فقط
+    واحد ترکیبی «ضد_افتاب» باقی می‌ماند، نه «افتاب» به‌تنهایی) تا تطبیق
+    وارونه رخ ندهد؛ همین تابع برای متن ایندکس و پرس‌وجو یکسان اجرا می‌شود،
+    پس دو طرف هم‌سو می‌مانند."""
     tokens = tokenize(text, drop_stopwords=drop_stopwords)
     bigrams = [f"{a}_{b}" for a, b in zip(tokens, tokens[1:])]
-    return tokens + bigrams
+
+    suppressed = {
+        i + 1 for i, t in enumerate(tokens)
+        if t in NEGATION_PREFIXES and i + 1 < len(tokens)
+    }
+    unigrams = [t for i, t in enumerate(tokens) if i not in suppressed]
+    return unigrams + bigrams
