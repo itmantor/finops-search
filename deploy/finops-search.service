@@ -1,0 +1,17 @@
+[Unit]
+Description=FinOps Search — gunicorn (server.app:app)
+After=network.target
+
+[Service]
+Type=simple
+User=itman
+Group=itman
+WorkingDirectory=/home/itman/finops_search_v2
+Environment=PATH=/home/itman/finops_search_v2/venv/bin
+ExecStart=/home/itman/finops_search_v2/venv/bin/gunicorn --preload -w 2 -b 127.0.0.1:8000 --timeout 60 server.app:app
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

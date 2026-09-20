@@ -1,10 +1,13 @@
 openai>=1.30.0
 numpy
 faiss-cpu
+openpyxl
+flask
+gunicorn
+python-dotenv
+rank_bm25
+
+# فقط برای پایپ‌لاین قدیمی/بازنشسته (pipeline/legacy/) لازم است
 scikit-learn
 hdbscan
 umap-learn
-openpyxl
-flask
-python-dotenv
-rank_bm25

@@ -1,128 +1,146 @@
-# راهنمای ابزار جستجوی شناسه کالا و خدمت — نسخه V2
+# راهنمای ابزار جستجوی شناسه کالا و خدمت
 
-این نسخه نسبت به نسخه قبلی، به‌جای جستجوی صرفاً واژگانی/شباهت متنی خام،
-یک پایپ‌لاین کامل دارد: دسته‌بندی خودکار کالاها (Taxonomy) + Embedding
-غنی‌شده + جستجوی برداری سریع با FAISS + امکان مرتب‌سازی نهایی با GPT.
+این ابزار شرح آزاد کاربر را می‌گیرد و شناسه‌های تولید داخل و وارداتی
+کاتالوگ مالیاتی را پیدا می‌کند. دو حالت جستجو دارد:
 
----
+- **جستجوی سریع** — فقط کانال واژگانی (BM25)، بدون فراخوانی OpenAI، فوری
+  و رایگان. حالت پیش‌فرض.
+- **جستجوی هوشمند** — ابتدا فهم پرس‌وجو (برند/عبارت پاک‌شده/کلیدواژه‌ها)،
+  سپس بازیابی هیبرید (BM25 + جستجوی معنایی با FAISS، ترکیب با RRF). چند
+  ثانیه طول می‌کشد و نیاز به کلید OpenAI دارد.
 
-## ⚠️ نکته امنیتی مهم (قبل از هر چیز)
+هر جستجو (پرس‌وجوی خام، حالت، و نتایج نمایش‌داده‌شده) در `logs/search_log.jsonl`
+ثبت می‌شود — این داده‌ی واقعی کاربران است و منبع اصلی برای بهبود جستجو در
+آینده خواهد بود (خیلی معتبرتر از ۱۷ مورد دستی `benchmark.json`).
 
-در نسخه قبلی، کلید API داخل فایل `config.json` به‌صورت متن ساده ذخیره می‌شد.
-اگر آن فایل (یا هر فایلی مثل `embeddings.pkl` که کنارش بوده) را جایی
-فرستاده‌اید یا در گیت commit کرده‌اید:
-
-1. همین حالا وارد پنل OpenAI شوید (platform.openai.com → API keys) و آن
-   کلید را **Revoke/Delete** کنید.
-2. یک کلید جدید بسازید.
-3. فایل‌های `config.json` و `embeddings.pkl` قدیمی را حذف کنید — دیگر در
-   نسخه جدید استفاده نمی‌شوند.
-
-در این نسخه، کلید فقط در فایل `.env` نگهداری می‌شود که در `.gitignore` قرار
-دارد و هرگز نباید فرستاده یا commit شود.
+> نکته: مرحله‌ی انتخاب نهایی با GPT (`search/select.py`) عمداً در محصول
+> استفاده نمی‌شود — طبق محک، دقتش از نمایش مستقیم رتبه‌ی اول بازیابی بهتر
+> نبود. فایل در مخزن نگه داشته شده برای بازبینی بعدی.
 
 ---
 
-## پیش‌نیاز: نصب پایتون
+## ⚠️ نکته امنیتی
 
-اگر پایتون نصب نیست: از python.org آخرین نسخه را نصب کنید و هنگام نصب
-گزینه‌ی «Add Python to PATH» را تیک بزنید. برای اطمینان:
+کلید OpenAI فقط در فایل `.env` نگهداری می‌شود که در `.gitignore` قرار دارد
+و هرگز نباید commit یا در جایی فرستاده شود.
+
+---
+
+## معماری فعلی
+
 ```
-python --version
+data/taxonomy.xlsx (Sheet2)
+        │
+        ▼
+common/catalog.py            ← شرح‌های یکتا + همه‌ی شناسه‌های تولید داخل/وارداتی هرکدام
+        │
+        ├─► pipeline/embed_catalog.py    ─► checkpoints/catalog_embeddings.jsonl        (بردار خام، فعلاً استفاده نمی‌شود)
+        ├─► pipeline/enrich_catalog.py   ─► checkpoints/catalog_enrichment.jsonl        (پاس ۱: canonical/synonyms/examples_raw/uses)
+        │                                 checkpoints/catalog_examples.jsonl            (پاس ۲: examples بازبینی‌شده)
+        ├─► pipeline/embed_enriched.py   ─► checkpoints/catalog_embeddings_enriched.jsonl (بردار شرح+canonical؛ ۷۴۲ مگابایت)
+        └─► pipeline/build_search_index.py ─► checkpoints/catalog_semantic.index         (FAISS، سبک)
+                                              checkpoints/catalog_semantic_positions.npy  (نگاشت به کاتالوگ)
 ```
 
-## نصب پروژه
+سرور (`server/app.py`) فقط از این‌ها می‌خواند، نه از jsonl خام ۷۴۲ مگابایتی:
+- `common/catalog.py` → کاتالوگ
+- `search/enrichment.py` + `checkpoints/catalog_enrichment.jsonl` + `catalog_examples.jsonl` → متن ایندکس واژگانی غنی‌شده
+- `search/lexical.py` (BM25، در حافظه ساخته می‌شود)
+- `search/semantic.py` → `SemanticIndex.from_prebuilt(...)` روی `catalog_semantic.index` + `catalog_semantic_positions.npy`
+- `search/hybrid.py` (ترکیب با RRF) + `search/understand.py` (فقط در حالت هوشمند)
 
-۱. این پوشه را جایی مثل Desktop قرار دهید.
+پایپ‌لاین قدیمی (خوشه‌بندی + Taxonomy خودکار + FAISS تخت روی شرح خام) به
+`pipeline/legacy/` منتقل شده و دیگر توسط سرور استفاده نمی‌شود — نگاه کنید
+به `pipeline/legacy/README.md`.
 
-۲. Terminal یا Command Prompt را در همین پوشه باز کنید و کتابخانه‌ها را نصب کنید:
+---
+
+## نصب
+
 ```
 pip install -r requirements.txt
 ```
-(نصب `hdbscan` و `faiss-cpu` ممکن است چند دقیقه طول بکشد.)
 
-۳. فایل `.env.example` را کپی کرده و به نام `.env` تغییر نام دهید. سپس آن
-   را باز کنید و مقادیر زیر را پر کنید:
-```
-OPENAI_API_KEY=کلید_شما
-INPUT_FILE=data/stuffpubliccode.csv
-```
-فایل CSV یا XLSX کالاها را داخل پوشه‌ی `data/` قرار دهید و مسیرش را در
-`INPUT_FILE` بنویسید (هم فرمت `StuffCod,type,date,RunDate,Vat,Description`
-و هم فرمت `ID,DescriptionOfID,...,Type` پشتیبانی می‌شود).
+`.env.example` را کپی و به `.env` تغییر نام دهید، سپس `OPENAI_API_KEY` را پر کنید.
+(کلید فقط برای «جستجوی هوشمند» و برای اجرای مجدد پایپ‌لاین غنی‌سازی لازم است؛
+«جستجوی سریع» بدون کلید هم کار می‌کند.)
 
 ---
 
-## اجرای پایپ‌لاین (یک‌بار، قبل از استفاده از جستجو)
+## اجرا برای توسعه (لوکال)
 
-ساده‌ترین راه، اجرای همه‌چیز با یک دستور:
-```
-python pipeline/run_all.py
-```
-
-این کار مراحل زیر را پشت‌سرهم انجام می‌دهد:
-
-| # | مرحله | خروجی |
-|---|-------|-------|
-| ۱ | Embedding اولیه روی شرح خام | `checkpoints/embeddings_initial.jsonl` |
-| ۲ | خوشه‌بندی خودکار (UMAP + HDBSCAN) | `checkpoints/clusters.pkl` |
-| ۳ | تولید Taxonomy با GPT برای هر خوشه | `outputs/taxonomy.xlsx`, `outputs/taxonomy.json` |
-| ۴ | تخصیص دسته‌بندی به هر کالا | `outputs/categorized_goods.xlsx` |
-| ۵ | ساخت متن غنی‌شده (Embedding_Text) | `outputs/embedding_data.xlsx` |
-| ۶ | Embedding نهایی روی متن غنی‌شده | `checkpoints/embeddings_final.jsonl` |
-| ۷ | ساخت ایندکس FAISS | `outputs/faiss.index`, `outputs/metadata.pkl` |
-
-### قابلیت Resume (ادامه بعد از قطع‌شدن)
-
-مراحل ۱، ۳ و ۶ (که با OpenAI کار می‌کنند) هر رکورد/خوشه‌ی پردازش‌شده را
-بلافاصله در فایل checkpoint ذخیره می‌کنند. اگر اینترنت قطع شود، برنامه
-بسته شود یا سیستم ری‌استارت شود، کافی‌ست دوباره اجرا کنید:
-```
-python pipeline/run_all.py
-```
-رکوردهای قبلاً پردازش‌شده دوباره پردازش (و دوباره هزینه) نمی‌شوند.
-
-می‌توانید هر مرحله را هم جداگانه اجرا کنید، مثلاً برای تست:
-```
-python pipeline/01_embed_initial.py
-```
-
-### هزینه و زمان تقریبی
-با حدود ۴۷ هزار رکورد:
-- مرحله ۱ و ۶ (Embedding): دو بار روی کل داده، هزینه هرکدام چند ده سنت.
-- مرحله ۳ (Taxonomy): به تعداد خوشه‌ها (نه رکوردها) یک تماس GPT — معمولاً چند صد تماس.
-- زمان کل به تعداد رکورد و سرعت اینترنت بستگی دارد؛ می‌توانید در چند نوبت اجرا کنید.
-
----
-
-## اجرای سرور جستجو
-
-بعد از تکمیل پایپ‌لاین:
 ```
 python server/app.py
 ```
-مرورگر خودکار باز می‌شود (یا به `http://localhost:8000` بروید).
+به `http://localhost:8000` بروید.
 
-- **جستجوی متنی**: رایگان، فوری، نیازی به کلید ندارد.
-- **جستجوی معنایی**: ترکیبی از ۷۰٪ شباهت معنایی (FAISS) + ۳۰٪ شباهت
-  کلیدواژه‌ای. نیاز به کلید OpenAI دارد.
-- **GPT ReRank** (تیک اختیاری کنار فیلترها، فقط در حالت معنایی): ۵۰ نتیجه
-  برتر را به GPT می‌دهد تا بهترین ۱۰ مورد را دوباره ارزیابی و مرتب کند.
-  دقیق‌تر ولی کمی کندتر و پرهزینه‌تر از حالت معمولی است.
+## اجرا در تولید
+
+سرویس با `gunicorn --preload` و حداکثر ۲ worker اجرا می‌شود تا کاتالوگ و
+ایندکس‌ها فقط یک‌بار در پردازه‌ی master بارگذاری شوند و بین workerها به
+اشتراک بروند (نه چند بار در حافظه تکرار شوند). این کار از طریق systemd
+انجام می‌شود — به بخش «سرویس systemd» زیر نگاه کنید.
+
+nginx روی پورت ۸۰۸۰ با Basic Auth به `127.0.0.1:8000` proxy می‌کند
+(تنظیمات آن جدا از این پروژه است و تغییری در آن لازم نیست).
 
 ---
 
-## تغییر یا به‌روزرسانی فایل داده
+## به‌روزرسانی کاتالوگ یا غنی‌سازی
 
-اگر فایل کالاها عوض شد یا رکورد جدید اضافه شد:
-۱. `INPUT_FILE` را در `.env` به مسیر جدید تغییر دهید (یا فایل قبلی را
-   به‌روزرسانی کنید).
-۲. دوباره `python pipeline/run_all.py` را اجرا کنید.
+اگر `data/taxonomy.xlsx` عوض شد، یا خواستید غنی‌سازی را دوباره اجرا کنید:
 
-نکته: مرحله‌ی ۲ (خوشه‌بندی) Resume ندارد و با هر اجرا از نو محاسبه می‌شود
-(چون محلی و نسبتاً سریع است). اگر فقط چند رکورد جدید اضافه شده، مراحل ۱، ۳
-و ۶ فقط رکوردهای جدید را پردازش می‌کنند، ولی مرحله ۲ و ۴ به ۷ روی کل داده
-دوباره اجرا می‌شوند.
+```
+# ۱. کش کاتالوگ را دوباره می‌سازد (خودکار، چون xlsx جدیدتر از cache است)
+python -c "from common.catalog import load_catalog; load_catalog(force_rebuild=True)"
+
+# ۲. غنی‌سازی (پاس ۱ + پاس ۲) — Resume دارد، فقط شرح‌های جدید/ناتمام را پردازش می‌کند
+python pipeline/enrich_catalog.py
+
+# ۳. Embedding معنایی روی شرح+canonical — Resume دارد
+python pipeline/embed_enriched.py
+
+# ۴. تبدیل به فایل‌های سبک FAISS + numpy که سرور می‌خواند (همیشه بعد از ۲ و ۳ لازم است)
+python pipeline/build_search_index.py
+
+# ۵. سرویس را ری‌استارت کنید تا کاتالوگ/ایندکس تازه بارگذاری شود
+sudo systemctl restart finops-search
+```
+
+برای سنجش کیفیت قبل از استقرار، از `bench.py` استفاده کنید (نگاه کنید به
+docstring بالای خودش برای پرچم‌های `--mode`, `--understand`, `--enriched`, `--select`).
+
+---
+
+## سرویس systemd
+
+فایل واحد در `deploy/finops-search.service` نگه داشته می‌شود. نصب/فعال‌سازی
+(یک‌بار، نیاز به sudo):
+
+```
+sudo cp deploy/finops-search.service /etc/systemd/system/finops-search.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now finops-search
+```
+
+بررسی وضعیت:
+```
+sudo systemctl status finops-search
+```
+
+ری‌استارت (مثلاً بعد از به‌روزرسانی کد یا ایندکس):
+```
+sudo systemctl restart finops-search
+```
+
+خواندن لاگ‌ها:
+```
+sudo journalctl -u finops-search -f          # زنده
+sudo journalctl -u finops-search -n 200      # ۲۰۰ خط آخر
+```
+
+سرویس با `Restart=always` اجرا می‌شود و در بوت سیستم هم خودکار بالا می‌آید
+(به‌خاطر `enable`)، پس قطع SSH یا ری‌استارت سرور آن را متوقف نمی‌کند.
 
 ---
 
@@ -130,25 +148,34 @@ python server/app.py
 
 ```
 finops_search_v2/
-├── .env                  ← تنظیمات محرمانه شما (خودتان می‌سازید، در گیت نیست)
-├── .env.example          ← قالب تنظیمات
+├── .env                        ← تنظیمات محرمانه (در گیت نیست)
 ├── requirements.txt
-├── data/                 ← فایل CSV/XLSX ورودی خودتان را اینجا بگذارید
-├── checkpoints/           ← فایل‌های میانی Resume (خودکار ساخته می‌شود)
-├── outputs/               ← taxonomy.xlsx, categorized_goods.xlsx, faiss.index, ...
+├── deploy/
+│   └── finops-search.service   ← واحد systemd
+├── data/                       ← taxonomy.xlsx
+├── checkpoints/                ← فایل‌های میانی (غنی‌سازی، Embedding، ایندکس FAISS)
+├── logs/
+│   └── search_log.jsonl        ← لاگ هر جستجوی واقعی (پرس‌وجو، حالت، نتایج نمایش‌داده‌شده)
 ├── common/
-│   ├── config.py          ← بارگذاری تنظیمات از .env
-│   └── utils.py           ← خواندن داده، Checkpoint، Retry
+│   ├── catalog.py               ← شرح‌های یکتا + شناسه‌های تولید داخل/وارداتی
+│   ├── config.py                ← بارگذاری تنظیمات از .env
+│   ├── textnorm.py              ← نرمال‌سازی/توکنایز فارسی
+│   └── utils.py
+├── search/
+│   ├── lexical.py                ← ایندکس BM25
+│   ├── semantic.py               ← ایندکس FAISS (+ from_prebuilt برای سرور)
+│   ├── hybrid.py                 ← ترکیب با RRF
+│   ├── understand.py             ← فهم پرس‌وجو (فقط حالت هوشمند)
+│   ├── enrichment.py             ← ساخت متن ایندکس از خروجی غنی‌سازی
+│   └── select.py                 ← انتخاب نهایی با GPT — در محصول استفاده نمی‌شود
 ├── pipeline/
-│   ├── 01_embed_initial.py
-│   ├── 02_cluster.py
-│   ├── 03_taxonomy.py
-│   ├── 04_categorize.py
-│   ├── 05_build_embedding_text.py
-│   ├── 06_embed_final.py
-│   ├── 07_build_faiss.py
-│   └── run_all.py         ← اجرای همه مراحل پشت‌سرهم
+│   ├── embed_catalog.py
+│   ├── enrich_catalog.py
+│   ├── embed_enriched.py
+│   ├── build_search_index.py    ← ساخت ایندکس سبک برای سرور (بعد از هر تغییر کاتالوگ/غنی‌سازی اجرا شود)
+│   └── legacy/                  ← پایپ‌لاین قدیمی، بازنشسته (نگاه کنید به legacy/README.md)
+├── bench.py                     ← اجراکننده‌ی محک روی benchmark.json
 └── server/
-    ├── app.py              ← سرور Flask
+    ├── app.py
     └── templates/index.html
 ```

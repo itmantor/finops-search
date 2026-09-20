@@ -1,159 +1,112 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-سرور جستجوی شناسه کالا — نسخه V2
+سرور جستجوی شناسه کالا — نسخه هیبرید (لایه بازیابی جدید)
 ------------------------------------
-- جستجوی متنی رایگان (substring)
-- جستجوی معنایی با FAISS
-- جستجوی ترکیبی: 70% امتیاز معنایی + 30% امتیاز کلیدواژه
-- GPT ReRank اختیاری روی ۵۰ نتیجه برتر برای انتخاب و مرتب‌سازی ۱۰ مورد نهایی
+دو حالت جستجو:
+  - "fast"  (جستجوی سریع)  : فقط کانال واژگانی BM25، بدون فراخوانی OpenAI، فوری و رایگان.
+  - "smart" (جستجوی هوشمند): فهم پرس‌وجو (search/understand.py) + بازیابی هیبرید
+                              (search/hybrid.py؛ BM25 + معنایی، ترکیب با RRF).
 
-اجرا:
+مرحله‌ی انتخاب نهایی (search/select.py) عمداً استفاده نمی‌شود — طبق محک،
+دقت آن از گرفتن رتبه‌ی اول بازیابی بهتر نبود.
+
+کاتالوگ، ایندکس واژگانی و ایندکس معنایی همگی در سطح ماژول (یک‌بار، هنگام
+import) بارگذاری می‌شوند تا با gunicorn --preload بین همه‌ی workerها به
+اشتراک گذاشته شوند.
+
+اجرا (توسعه):
     python server/app.py
-سپس مرورگر را به http://localhost:8000 ببرید (یا پورت تنظیم‌شده در .env).
+اجرا (تولید): از طریق systemd + gunicorn، نگاه کنید به README.md
 """
+import datetime
 import json
-import os
-import pickle
-import re
 import sys
-import webbrowser
 import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import faiss
-import numpy as np
 from flask import Flask, jsonify, render_template, request
-from openai import OpenAI
 
-from common.config import CHAT_MODEL, EMBED_MODEL, OPENAI_API_KEY, OUTPUT_DIR, PORT
+from common.catalog import load_catalog
+from common.config import CHECKPOINT_DIR, LOGS_DIR, OPENAI_API_KEY, PORT
+from search.enrichment import load_enrichment, make_lexical_text_fn
+from search.hybrid import HybridIndex
+from search.lexical import LexicalIndex
+from search.semantic import SemanticIndex
+from search.understand import QueryUnderstander
+
+MODE_FAST = "fast"
+MODE_SMART = "smart"
+RESULT_LIMIT = 8
+
+SEMANTIC_INDEX_PATH = CHECKPOINT_DIR / "catalog_semantic.index"
+SEMANTIC_POSITIONS_PATH = CHECKPOINT_DIR / "catalog_semantic_positions.npy"
+SEARCH_LOG_PATH = LOGS_DIR / "search_log.jsonl"
 
 app = Flask(__name__)
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+_log_lock = threading.Lock()
 
-INDEX_PATH = OUTPUT_DIR / "faiss.index"
-META_PATH = OUTPUT_DIR / "metadata.pkl"
+print("⏳ در حال بارگذاری کاتالوگ و ایندکس‌ها ...")
 
-INDEX = None
-META = None
+ITEMS = load_catalog()
+ENRICHMENT = load_enrichment()  # پیکربندی انتخاب‌شده طبق بنچمارک: غنی‌سازی با examples
+LEXICAL = LexicalIndex(items=ITEMS, text_fn=make_lexical_text_fn(ENRICHMENT, include_examples=True))
 
-EXPAND_CACHE = {}
+SEMANTIC = None
+HYBRID = None
+if SEMANTIC_INDEX_PATH.exists() and SEMANTIC_POSITIONS_PATH.exists():
+    SEMANTIC = SemanticIndex.from_prebuilt(SEMANTIC_INDEX_PATH, SEMANTIC_POSITIONS_PATH, items=ITEMS)
+    HYBRID = HybridIndex(LEXICAL, SEMANTIC)
+else:
+    print("⚠️  ایندکس معنایی از پیش‌ساخته پیدا نشد. اجرا کنید: python pipeline/build_search_index.py")
 
-EXPAND_PROMPT = """شما یک دستیار متخصص در شناسایی کالاهای صنعتی و تجاری در بازار ایران هستید.
-عبارت جستجوی کوتاه زیر را به قالب زیر گسترش بده تا با ساختار متنی که برای ایندکس‌کردن کالاها استفاده شده هم‌خوان باشد:
+UNDERSTANDER = QueryUnderstander()
 
-نام کالا: <نام کامل و رایج کالا>
-
-دسته اصلی: <دسته‌بندی سطح بالا>
-زیرگروه: <زیرگروه تخصصی‌تر>
-رده تخصصی: <رده دقیق‌تر، در صورت وجود>
-
-کلمات مرتبط:
-<چند مترادف یا اصطلاح رایج بازار ایران برای همین کالا، هرکدام در یک خط>
-
-قوانین مهم (حتماً رعایت شود):
-- فقط از مترادف‌ها، نام‌های رایج و دسته‌بندی‌های واقعی و متداول در بازار ایران استفاده کن.
-- هیچ توضیح خلاقانه، جزئیات ساختگی یا حدس دور از واقعیت اضافه نکن.
-- اگر کالا را با اطمینان نمی‌شناسی، یک دسته‌بندی کلی‌تر و امن‌تر انتخاب کن، نه جزئیات نامطمئن.
-- خروجی باید کاملاً به زبان فارسی و دقیقاً با همین قالب (بدون توضیح اضافه، بدون مقدمه) باشد.
-
-عبارت جستجو: {query}"""
+print(f"✅ آماده — {len(ITEMS):,} شرح یکتا بارگذاری شد.")
 
 
-def expand_query(query):
-    """عبارت کوتاه کاربر را با یک فراخوانی GPT به قالب متن غنی‌شده اسناد (مرحله ۵ پایپ‌لاین) تبدیل می‌کند."""
-    if query in EXPAND_CACHE:
-        return EXPAND_CACHE[query]
-    if client is None:
-        return None
-    try:
-        resp = client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[{"role": "user", "content": EXPAND_PROMPT.format(query=query)}],
-        )
-        expanded = (resp.choices[0].message.content or "").strip()
-        if not expanded:
-            return None
-    except Exception as e:
-        print(f"⚠️  خطا در گسترش عبارت جستجو: {e}")
-        return None
-    EXPAND_CACHE[query] = expanded
-    return expanded
+def _to_scored_percent(results):
+    """تبدیل [(item, خام‌امتیاز)] به [(item, درصد نسبی به بهترین نتیجه‌ی همین فهرست)]."""
+    if not results:
+        return []
+    top = results[0][1]
+    if top <= 0:
+        return [(item, 0) for item, _ in results]
+    return [(item, round(max(0.0, min(1.0, score / top)) * 100)) for item, score in results]
 
 
-def load_index():
-    global INDEX, META
-    if INDEX_PATH.exists() and META_PATH.exists():
-        INDEX = faiss.read_index(str(INDEX_PATH))
-        with open(META_PATH, "rb") as f:
-            META = pickle.load(f)
-        print(f"✅ ایندکس با {len(META['ids']):,} رکورد بارگذاری شد.")
-    else:
-        print("⚠️  ایندکس FAISS پیدا نشد. ابتدا کل پایپ‌لاین را اجرا کنید: python pipeline/run_all.py")
-
-
-load_index()
-
-
-def keyword_score(query, desc):
-    query = (query or "").strip()
-    desc = desc or ""
-    if not query:
-        return 0.0
-    if query in desc:
-        return 1.0 if desc.startswith(query) else 0.7
-    q_words = set(query.split())
-    d_words = set(desc.split())
-    if not q_words:
-        return 0.0
-    return len(q_words & d_words) / len(q_words)
-
-
-def passes_filter(i, type_filter):
-    if type_filter == "all":
-        return True
-    typ = META["types"][i] if META.get("types") else ""
-    if type_filter == "general":
-        return "عمومی" in typ
-    if type_filter == "specific":
-        return "اختصاصی" in typ
-    return True
-
-
-def make_record(i):
+def make_record(item, score):
     return {
-        "id": META["ids"][i],
-        "desc": META["descs"][i],
-        "type": META["types"][i] if META.get("types") else "",
-        "level1": META["level1"][i] if META.get("level1") else "",
+        "description": item.description,
+        "domestic_ids": list(item.domestic_ids),
+        "imported_ids": list(item.imported_ids),
+        "score": score,
     }
 
 
-def gpt_rerank(query, candidates):
-    """از میان نامزدها، GPT بهترین ۱۰ مورد را انتخاب و بر اساس ارتباط مرتب می‌کند."""
-    items = [{"idx": n, "desc": META["descs"][i]} for n, (_, i, _) in enumerate(candidates)]
-    prompt = (
-        f"عبارت جستجو: {query}\n\n"
-        "کالاهای زیر را بر اساس ارتباط معنایی واقعی با عبارت جستجو ارزیابی کن، "
-        "بهترین ۱۰ مورد را انتخاب و به ترتیب ارتباط مرتب کن.\n"
-        "فقط یک آرایه JSON از عدد idx ها برگردان، مثل: [3, 7, 1]\n\n"
-        + "\n".join(f"{it['idx']}: {it['desc']}" for it in items)
-    )
+def _log_search(query, mode, results):
+    entry = {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "query": query,
+        "mode": mode,
+        "results": [
+            {
+                "description": r["description"],
+                "domestic_ids": r["domestic_ids"],
+                "imported_ids": r["imported_ids"],
+            }
+            for r in results
+        ],
+    }
     try:
-        resp = client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = resp.choices[0].message.content
-        match = re.search(r"\[[\d,\s]+\]", text)
-        order = json.loads(match.group(0)) if match else []
-        reranked = [candidates[n] for n in order if 0 <= n < len(candidates)]
-        return reranked or candidates[:10]
+        line = json.dumps(entry, ensure_ascii=False) + "\n"
+        with _log_lock:
+            with open(SEARCH_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line)
     except Exception as e:
-        print(f"⚠️  خطا در GPT ReRank: {e}")
-        return candidates[:10]
+        print(f"⚠️  خطا در ثبت لاگ جستجو: {e}")
 
 
 @app.route("/")
@@ -164,8 +117,8 @@ def index():
 @app.route("/api/status")
 def status():
     return jsonify({
-        "record_count": len(META["ids"]) if META else 0,
-        "has_index": INDEX is not None,
+        "record_count": len(ITEMS),
+        "has_smart": HYBRID is not None and bool(OPENAI_API_KEY),
         "has_api_key": bool(OPENAI_API_KEY),
     })
 
@@ -174,85 +127,31 @@ def status():
 def search():
     payload = request.get_json(force=True, silent=True) or {}
     query = (payload.get("query") or "").strip()
-    mode = payload.get("mode", "text")
-    type_filter = payload.get("type_filter", "all")
-    rerank = bool(payload.get("rerank", False))
+    mode = payload.get("mode") or MODE_FAST
 
     if not query:
         return jsonify({"results": []})
 
-    if META is None or INDEX is None:
-        return jsonify({"error": "ایندکس آماده نیست. ابتدا پایپ‌لاین را اجرا کنید (python pipeline/run_all.py)."})
-
-    if mode == "text":
-        results = []
-        for i, desc in enumerate(META["descs"]):
-            if query in desc and passes_filter(i, type_filter):
-                results.append(make_record(i))
-        return jsonify({"results": results[:50]})
-
-    # mode == semantic : ابتدا تطابق متنی دقیق، سپس تکمیل با جستجوی معنایی/ترکیبی (۷۰٪ معنایی + ۳۰٪ کلیدواژه)
-    if client is None:
-        return jsonify({"error": "برای جستجوی معنایی، کلید OpenAI در .env لازم است."})
-
-    exact_starts, exact_rest, exact_idxs = [], [], set()
-    for i, desc in enumerate(META["descs"]):
-        if query in desc and passes_filter(i, type_filter):
-            exact_idxs.add(i)
-            (exact_starts if desc.startswith(query) else exact_rest).append(i)
-
-    exact_results = []
-    for i in (exact_starts + exact_rest)[:20]:
-        rec = make_record(i)
-        rec["score"] = 100
-        rec["match_type"] = "exact"
-        exact_results.append(rec)
-
-    remaining = 20 - len(exact_results)
-    expanded_query = None
-    semantic_results = []
-
-    if remaining > 0:
-        expanded_query = expand_query(query)
-        embed_input = expanded_query or query
-
+    if mode == MODE_SMART:
+        if not OPENAI_API_KEY:
+            return jsonify({"error": "برای «جستجوی هوشمند»، کلید OpenAI در .env لازم است."})
+        if HYBRID is None:
+            return jsonify({"error": "ایندکس معنایی آماده نیست. ابتدا python pipeline/build_search_index.py را اجرا کنید."})
         try:
-            qvec = np.array(
-                client.embeddings.create(model=EMBED_MODEL, input=[embed_input]).data[0].embedding,
-                dtype="float32",
-            ).reshape(1, -1)
+            lexical_query = UNDERSTANDER.lexical_query(query)
+            semantic_query = UNDERSTANDER.semantic_query(query)
+            raw_results = HYBRID.search_split(lexical_query, semantic_query, k=RESULT_LIMIT)
         except Exception as e:
             return jsonify({"error": f"خطا در ارتباط با OpenAI: {e}"})
+    else:
+        mode = MODE_FAST
+        raw_results = LEXICAL.search(query, k=RESULT_LIMIT)
 
-        faiss.normalize_L2(qvec)
-        scores, idxs = INDEX.search(qvec, 50)
+    results = [make_record(item, pct) for item, pct in _to_scored_percent(raw_results)]
+    _log_search(query, mode, results)
 
-        combined = []
-        for score, i in zip(scores[0], idxs[0]):
-            if i < 0 or i in exact_idxs or not passes_filter(i, type_filter):
-                continue
-            semantic = float(score)
-            kw = keyword_score(query, META["descs"][i])
-            final = 0.7 * semantic + 0.3 * kw
-            combined.append((final, i, semantic))
-
-        combined.sort(key=lambda x: x[0], reverse=True)
-        top = combined[:20]
-
-        if rerank and top:
-            top = gpt_rerank(query, top)
-
-        for final, i, semantic in top:
-            rec = make_record(i)
-            rec["score"] = round(final * 100)
-            rec["match_type"] = "semantic"
-            semantic_results.append(rec)
-
-    results = exact_results + semantic_results[:remaining]
-
-    return jsonify({"results": results, "expanded_query": expanded_query or ""})
+    return jsonify({"results": results})
 
 
 if __name__ == "__main__":
-    threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", PORT)), debug=False)
+    app.run(host="0.0.0.0", port=PORT, debug=False)

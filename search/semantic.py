@@ -6,6 +6,11 @@
 می‌شوند و در یک IndexFlatIP فیس ذخیره می‌شوند. Embedding پرس‌وجو در زمان
 جستجو و با فراخوانی API انجام می‌شود؛ نتیجه در حافظه کش می‌شود تا اجراهای
 تکراری محک هزینه‌ی دوباره نداشته باشند.
+
+برای سرور تولید، به‌جای پارس‌کردن jsonl خام (که برای نسخه‌ی غنی‌شده حدود
+۷۴۲ مگابایت است) از SemanticIndex.from_prebuilt استفاده کنید که یک ایندکس
+FAISS و آرایه‌ی numpy از پیش‌ساخته را می‌خواند (نگاه کنید به
+pipeline/build_search_index.py).
 """
 import hashlib
 import json
@@ -63,6 +68,20 @@ class SemanticIndex:
 
         self._client = None
         self._query_cache = {}
+
+    @classmethod
+    def from_prebuilt(cls, index_path, positions_path, items=None):
+        """بارگذاری سریع از ایندکس FAISS و آرایه‌ی موقعیت‌های از پیش‌ساخته
+        (pipeline/build_search_index.py)، بدون پارس‌کردن jsonl خام بردارها."""
+        obj = cls.__new__(cls)
+        all_items = items if items is not None else load_catalog()
+        positions = np.load(positions_path)
+        obj.items = [all_items[i] for i in positions]
+        obj._matrix = None
+        obj._index = faiss.read_index(str(index_path))
+        obj._client = None
+        obj._query_cache = {}
+        return obj
 
     def _embed_query(self, query):
         if query in self._query_cache:
