@@ -16,6 +16,15 @@ pipeline/enrich_catalog.py (canonical/synonyms/examples/uses) استفاده
 می‌کند (نگاه کنید به search/enrichment.py). --enriched all هر سه حالت
 (none / no-examples / with-examples) را کنار هم مقایسه می‌کند تا مشخص
 شود آیا examples واقعاً کمک می‌کند یا فقط نویز/ریسک اضافه می‌کند.
+پیش‌فرض with-examples است — طبق محک، recall@40 در این حالت بهترین است
+(معیاری که برای مرحله‌ی انتخاب اهمیت دارد، نه recall@5) و examples هزینه‌ی
+اضافه‌ای ندارد چون از قبل در پاس ۲ تولید شده.
+
+با پرچم --select، زنجیره‌ی کامل اجرا می‌شود: فهم پرس‌وجو -> بازیابی
+هیبرید -> انتخاب نهایی (search/select.py، یک فراخوانی CHAT_MODEL که فقط
+از میان کاندیدهای بازیابی‌شده انتخاب می‌کند). به‌جای recall@40/recall@5،
+top-1 accuracy گزارش می‌شود چون این معیاری است که کاربر نهایی واقعاً
+می‌بیند.
 """
 import argparse
 import json
@@ -198,6 +207,72 @@ def print_comparison(all_stats):
         print(f"{label:<20} {s['recall@40']:>10.3f} {s['recall@5']:>10.3f} {s['mrr']:>8.3f}")
 
 
+def run_select(label, search_fn, selector, cases):
+    """اجرای زنجیره‌ی کامل (فهم -> بازیابی هیبرید -> انتخاب) برای یک حالت؛
+    چاپ جدول جزئیات هر مورد (انتخاب نهایی، اطمینان، جایگزین‌ها) و بازگرداندن
+    recall@40 بازیابی + top-1 accuracy انتخاب نهایی."""
+    hits_40 = 0
+    hits_top1 = 0
+    rows = []
+
+    for case in cases:
+        query = case["query"]
+        expected = set(case["expected_descriptions"])
+        results = search_fn(query)
+        rank, _ = find_rank(results, expected)
+        if rank is not None:
+            hits_40 += 1
+
+        picked = selector.select(query, results)
+        correct = bool(picked["description"]) and picked["description"] in expected
+        if correct:
+            hits_top1 += 1
+
+        rows.append((query, expected, picked, correct))
+
+    n = len(cases)
+
+    print("=" * 100)
+    print(f"زنجیره‌ی کامل (فهم -> بازیابی هیبرید -> انتخاب): {label}")
+    print("=" * 100)
+    print(f"{'#':>3}  {'نتیجه':^6}  {'اطمینان':<9}  {'پرس‌وجو':<42} {'انتخاب‌شده'}")
+    print("-" * 100)
+    for i, (query, expected, picked, correct) in enumerate(rows, start=1):
+        mark = "✓" if correct else "✗"
+        conf = picked["confidence"] + ("*" if picked.get("fallback") else "")
+        desc = picked["description"] or "(هیچ‌کدام — index=null)"
+        print(f"{i:>3}  {mark:^6}  {conf:<9}  {query:<42} {desc}")
+        if not correct:
+            print(f"      انتظار: {' / '.join(expected)}")
+        if picked["alternates"]:
+            alts = "، ".join(f"#{a['rank']} {a['description']}" for a in picked["alternates"])
+            print(f"      جایگزین‌های پیشنهادی: {alts}")
+        if picked.get("fallback"):
+            print(f"      * fallback به رتبه‌ی اول بازیابی (شکست فراخوانی: {picked.get('error')})")
+        print()
+
+    fallback_count = sum(1 for _, _, p, _ in rows if p.get("fallback"))
+    low_conf_count = sum(1 for _, _, p, _ in rows if p["confidence"] == "low")
+
+    print("-" * 100)
+    print(f"تعداد موارد:         {n}")
+    print(f"recall@{TOP_K} (بازیابی): {hits_40 / n:.3f}  ({hits_40}/{n})")
+    print(f"top-1 accuracy:       {hits_top1 / n:.3f}  ({hits_top1}/{n})")
+    print(f"اطمینان پایین:        {low_conf_count}/{n}   (fallback در میان آن‌ها: {fallback_count})")
+    print()
+
+    return {"recall@40": hits_40 / n, "top1_accuracy": hits_top1 / n, "n": n}
+
+
+def print_select_comparison(all_stats):
+    print("=" * 60)
+    print("جدول مقایسه‌ی top-1 accuracy")
+    print("=" * 60)
+    print(f"{'حالت':<30} {'recall@40':>10} {'top-1':>10}")
+    for label, s in all_stats.items():
+        print(f"{label:<30} {s['recall@40']:>10.3f} {s['top1_accuracy']:>10.3f}")
+
+
 def print_understanding(cases, understander):
     print("=" * 100)
     print("خروجی فهم پرس‌وجو (query understanding)")
@@ -218,11 +293,20 @@ def main():
     parser.add_argument("--all", action="store_true", help="اجرای هر سه حالت و چاپ جدول مقایسه")
     parser.add_argument("--understand", action="store_true",
                          help="عبور پرس‌وجو از فهم پرس‌وجو (search/understand.py) پیش از بازیابی")
-    parser.add_argument("--enriched", choices=ENRICH_STATES + ["all"], default="none",
-                         help="متن ایندکس از غنی‌سازی کاتالوگ استفاده کند؛ all هر سه حالت را مقایسه می‌کند")
+    parser.add_argument("--enriched", choices=ENRICH_STATES + ["all"], default="with-examples",
+                         help="متن ایندکس از غنی‌سازی کاتالوگ استفاده کند؛ all هر سه حالت را مقایسه می‌کند "
+                              "(پیش‌فرض with-examples: بهترین recall@40 در محک، بدون هزینه‌ی اضافه)")
     parser.add_argument("--examples-source", choices=["reviewed", "raw"], default="reviewed",
                          help="reviewed: examples پاس ۲ (بازبینی‌شده)؛ raw: examples_raw پاس ۱ (بدون بازبینی، برای همه‌ی شرح‌ها)")
+    parser.add_argument("--select", action="store_true",
+                         help="اجرای زنجیره‌ی کامل (فهم -> بازیابی هیبرید -> انتخاب نهایی) و گزارش top-1 accuracy "
+                              "به‌جای recall@40/recall@5؛ همیشه mode=hybrid و understand روشن است")
     args = parser.parse_args()
+
+    if args.select:
+        args.mode = "hybrid"
+        args.all = False
+        args.understand = True
 
     modes = MODES if args.all else [args.mode]
     enrich_states = ENRICH_STATES if args.enriched == "all" else [args.enriched]
@@ -259,6 +343,17 @@ def main():
     mode_state_pairs = {(mode, state) for mode, state, _, _ in variants}
     indices = build_indices(mode_state_pairs, examples_source=args.examples_source)
     print("ایندکس(ها) آماده شد.\n")
+
+    if args.select:
+        from search.select import Selector
+        selector = Selector()
+        select_stats = {}
+        for mode, state, u, label in variants:
+            search_fn = make_search_fn(mode, indices[(mode, state)], u)
+            select_stats[label] = run_select(label, search_fn, selector, cases)
+        if len(select_stats) > 1:
+            print_select_comparison(select_stats)
+        return
 
     all_stats = {}
     for mode, state, u, label in variants:
