@@ -5,6 +5,13 @@
 شرح می‌تواند زیر چند شناسه (تولید داخل ۲۷۲۰ / وارداتی ۲۷۱۰) تکرار شده
 باشد. جستجو باید روی شرح‌های یکتا (~23700 مورد) انجام شود، نه سطرها.
 
+یک شرح می‌تواند بیش از یک شناسه‌ی تولید داخل یا وارداتی داشته باشد؛ همه‌ی
+آن‌ها در domestic_ids/imported_ids نگه داشته می‌شوند (نه فقط اولی)، چون
+این شناسه‌ها روی فاکتور مالیاتی درج می‌شوند و جا انداختن‌شان ریسک واقعی
+دارد. طبقه‌بندی هر شناسه بر اساس ستون Type انجام می‌شود (مرجع اصلی)؛
+پیشوند عددی (۲۷۲۰/۲۷۱۰) فقط وقتی Type خالی/نامعتبر باشد به‌عنوان جایگزین
+استفاده می‌شود.
+
 نتیجه‌ی پردازش در checkpoints/catalog.pkl کش می‌شود و فقط وقتی xlsx از
 کش جدیدتر باشد دوباره ساخته می‌شود.
 """
@@ -25,7 +32,8 @@ CACHE_PATH = CHECKPOINT_DIR / "catalog.pkl"
 DOMESTIC_PREFIX = "2720"
 IMPORTED_PREFIX = "2710"
 
-CatalogItem = namedtuple(
+
+class CatalogItem(namedtuple(
     "CatalogItem",
     [
         "description",
@@ -33,18 +41,51 @@ CatalogItem = namedtuple(
         "level2",
         "level3",
         "level4",
-        "domestic_id",
-        "imported_id",
+        "domestic_ids",
+        "imported_ids",
         "all_ids",
         "type_strings",
     ],
-)
+)):
+    __slots__ = ()
+
+    @property
+    def domestic_id(self):
+        """شناسه‌ی تولید داخل اول، برای سازگاری با کدهای قدیمی؛ کد جدید باید domestic_ids را بخواند."""
+        return self.domestic_ids[0] if self.domestic_ids else None
+
+    @property
+    def imported_id(self):
+        """شناسه‌ی وارداتی اول، برای سازگاری با کدهای قدیمی؛ کد جدید باید imported_ids را بخواند."""
+        return self.imported_ids[0] if self.imported_ids else None
 
 
 def _clean(v):
     if v is None:
         return ""
     return str(v).strip()
+
+
+def _classify_ids(recs):
+    """طبقه‌بندی شناسه‌های یک شرح به تولید داخل/وارداتی، بر اساس ستون Type
+    (مرجع اصلی و معتبر). فقط وقتی Type برای یک سطر خالی یا ناشناخته باشد،
+    به پیشوند عددی شناسه (۲۷۲۰/۲۷۱۰) به‌عنوان جایگزین رجوع می‌شود. شناسه‌های
+    خدماتی (Type = «شناسه عمومی خدمت») در هیچ‌کدام قرار نمی‌گیرند."""
+    domestic, imported = set(), set()
+    for r in recs:
+        rid = _clean(r.get("ID"))
+        if not rid:
+            continue
+        typ = _clean(r.get("Type"))
+        if "وارداتی" in typ:
+            imported.add(rid)
+        elif "تولید داخل" in typ:
+            domestic.add(rid)
+        elif rid.startswith(DOMESTIC_PREFIX):
+            domestic.add(rid)
+        elif rid.startswith(IMPORTED_PREFIX):
+            imported.add(rid)
+    return tuple(sorted(domestic)), tuple(sorted(imported))
 
 
 def _build_catalog(xlsx_path):
@@ -71,9 +112,8 @@ def _build_catalog(xlsx_path):
         )
         level1, level2, level3, level4 = path_counts.most_common(1)[0][0]
 
-        all_ids = sorted({_clean(r.get("ID")) for r in recs})
-        domestic_id = next((i for i in all_ids if i.startswith(DOMESTIC_PREFIX)), None)
-        imported_id = next((i for i in all_ids if i.startswith(IMPORTED_PREFIX)), None)
+        all_ids = tuple(sorted({_clean(r.get("ID")) for r in recs}))
+        domestic_ids, imported_ids = _classify_ids(recs)
         type_strings = tuple(sorted({_clean(r.get("Type")) for r in recs if _clean(r.get("Type"))}))
 
         items.append(CatalogItem(
@@ -82,9 +122,9 @@ def _build_catalog(xlsx_path):
             level2=level2,
             level3=level3,
             level4=level4,
-            domestic_id=domestic_id,
-            imported_id=imported_id,
-            all_ids=tuple(all_ids),
+            domestic_ids=domestic_ids,
+            imported_ids=imported_ids,
+            all_ids=all_ids,
             type_strings=type_strings,
         ))
 
@@ -97,7 +137,7 @@ def load_catalog(xlsx_path=None, cache_path=None, force_rebuild=False):
     cache_path = Path(cache_path) if cache_path else CACHE_PATH
 
     if not force_rebuild and cache_path.exists():
-        if cache_path.stat().st_mtime >= xlsx_path.stat().st_mtime:
+        if not xlsx_path.exists() or cache_path.stat().st_mtime >= xlsx_path.stat().st_mtime:
             with open(cache_path, "rb") as f:
                 return pickle.load(f)
 
