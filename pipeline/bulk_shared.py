@@ -11,7 +11,7 @@ from pathlib import Path
 
 import openpyxl
 
-MAX_ROWS = 200
+MAX_ROWS = 1001
 RETENTION_DAYS = 3  # فایل ورودی/نتیجه‌ی هر job بعد از این مدت از دیسک پاک می‌شود
 
 COL_ROW = "ردیف"

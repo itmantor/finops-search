@@ -231,6 +231,93 @@ def _job_dir(job_id):
     return d if d.is_dir() else None
 
 
+def _launch_bulk_job(job_dir):
+    """پردازه‌ی جدا و detach‌شده‌ی pipeline/bulk_lookup.py را برای این job
+    اجرا می‌کند و pid را در status.json ثبت می‌کند — هم برای شروع اول
+    (/api/bulk/start) هم برای ازسرگیری خودکار بعد از ری‌استارت سرور
+    (_resume_stale_bulk_jobs)."""
+    log_path = job_dir / "log.txt"
+    with open(log_path, "a", encoding="utf-8") as logf:
+        proc = subprocess.Popen(
+            [sys.executable, str(BULK_SCRIPT), str(job_dir)],
+            cwd=str(BASE_DIR), stdout=logf, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    status_path = job_dir / "status.json"
+    with open(status_path, encoding="utf-8") as fp:
+        status = json.load(fp)
+    status["pid"] = proc.pid
+    with open(status_path, "w", encoding="utf-8") as fp:
+        json.dump(status, fp, ensure_ascii=False, indent=2)
+
+
+def _pid_is_bulk_lookup(pid):
+    """آیا این pid واقعاً یک پردازه‌ی زنده‌ی bulk_lookup.py است؟ (نه یک pid
+    مرده که بعداً به پردازه‌ی کاملاً دیگری داده شده)."""
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            return b"bulk_lookup.py" in f.read()
+    except Exception:
+        return False
+
+
+_RESUME_SCAN_LOCK_HANDLE = None  # باید زنده بماند تا قفل نگه داشته شود؛ نگاه کنید به _resume_stale_bulk_jobs
+
+
+def _resume_stale_bulk_jobs():
+    """موقع بالا آمدن سرور اجرا می‌شود: هر job که وضعیتش «queued»/«processing»
+    مانده اما پردازه‌ی bulk_lookup.py آن دیگر زنده نیست (سرور یا خودِ آن
+    پردازه قبلاً کرش/ری‌استارت شده)، دوباره اجرا می‌شود — checkpoint سطح‌ردیف
+    خودِ آن اسکریپت (pipeline/bulk_lookup.py:CHECKPOINT_FILENAME) کاری را که
+    قبلاً تمام شده دوباره انجام نمی‌دهد.
+
+    نکته‌ی حیاتی که با آزمایش مستقیم روی سرور واقعی کشف شد: برخلاف تصور
+    docstring بالای فایل («یک‌بار، در سطح ماژول، با gunicorn --preload بین
+    workerها به اشتراک گذاشته می‌شود»)، این استقرار gunicorn واقعاً ماژول را
+    هم در master هم در هر worker (اینجا ۲تا) دوباره اجرا می‌کند — با لاگ
+    واقعی تأیید شد («✅ آماده» سه‌بار در هر ری‌استارت چاپ می‌شود). برای بارگذاری
+    ایندکس (ENGINE) این بی‌ضرر است (فقط حافظه/زمان هدر می‌رود)، اما برای این
+    تابع خطرناک است چون یک اثر جانبی واقعی دارد (اجرای subprocess) — بدون
+    قفل، هر job نیمه‌کاره سه‌بار همزمان اجرا می‌شد (سه برابر هزینه‌ی API
+    واقعی در حالت هوشمند). یک flock غیرمسدودکننده روی یک فایل ثابت تضمین
+    می‌کند فقط یکی از این سه پردازه واقعاً اسکن را انجام می‌دهد؛ چون قفل به
+    خودِ فایل‌توصیف‌گر باز وابسته است نه به وجود فایل، با پایان عمر آن پردازه
+    (یا ری‌استارت بعدی سرور) خودکار آزاد می‌شود."""
+    global _RESUME_SCAN_LOCK_HANDLE
+    if not UPLOAD_DIR.exists():
+        return
+
+    import fcntl
+    lock_path = UPLOAD_DIR / ".resume_scan.lock"
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_file.close()
+        return  # یک پردازه‌ی دیگر همین الان این اسکن را انجام می‌دهد یا داد
+    _RESUME_SCAN_LOCK_HANDLE = lock_file  # نگه‌داشتن مرجع تا fd بسته نشود و قفل باقی بماند
+
+    for job_dir in UPLOAD_DIR.iterdir():
+        status_path = job_dir / "status.json"
+        if not status_path.exists():
+            continue
+        try:
+            with open(status_path, encoding="utf-8") as f:
+                status = json.load(f)
+        except Exception:
+            continue
+        if status.get("status") not in ("queued", "processing"):
+            continue
+        pid = status.get("pid")
+        if pid and _pid_is_bulk_lookup(pid):
+            continue  # هنوز واقعاً در حال اجراست، دست نزن
+        print(f"🔁 ازسرگیری job نیمه‌کاره‌ی جستجوی گروهی: {job_dir.name}")
+        try:
+            _launch_bulk_job(job_dir)
+        except Exception as e:
+            print(f"⚠️  ازسرگیری job {job_dir.name} شکست خورد: {e}")
+
+
 @app.route("/api/bulk/template")
 def bulk_template():
     from pipeline.bulk_template import build_template_workbook
@@ -313,13 +400,7 @@ def bulk_start():
     with open(status_path, "w", encoding="utf-8") as fp:
         json.dump(status, fp, ensure_ascii=False, indent=2)
 
-    log_path = job_dir / "log.txt"
-    with open(log_path, "w", encoding="utf-8") as logf:
-        subprocess.Popen(
-            [sys.executable, str(BULK_SCRIPT), str(job_dir)],
-            cwd=str(BASE_DIR), stdout=logf, stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+    _launch_bulk_job(job_dir)
 
     return jsonify({"status": "queued"})
 
@@ -352,6 +433,8 @@ def bulk_result(job_id):
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+
+_resume_stale_bulk_jobs()  # با gunicorn --preload یک‌بار در پردازه‌ی master اجرا می‌شود
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False)

@@ -302,7 +302,7 @@ function bulkRenderIdle(errorMsg) {
   document.getElementById('bulkBody').innerHTML = `
     <label class="bulk-drop" id="bulkDrop">
       <input type="file" id="bulkFile" accept=".xlsx,.csv" onchange="bulkOnFilePicked(this.files[0])">
-      <div class="bulk-drop-text">یک فایل xlsx یا csv را اینجا انتخاب کنید (حداکثر ۲۰۰ ردیف)</div>
+      <div class="bulk-drop-text">یک فایل xlsx یا csv را اینجا انتخاب کنید (حداکثر ۱۰۰۱ ردیف)</div>
       <div class="bulk-file-name" id="bulkFileName"></div>
     </label>
     ${errorMsg ? `<div class="bulk-error">${escapeHtml(errorMsg)}</div>` : ''}
@@ -326,22 +326,37 @@ async function bulkOnFilePicked(file) {
   }
 }
 
+const LARGE_FILE_THRESHOLD = 200;   // بالاتر از این، انتخاب حالت اجباری می‌شود (نه پیش‌فرض)
+const ASSUMED_DAILY_QUOTA = 10000;  // فقط برای تخمین درصد مصرف سهمیه در هشدار؛ سهمیه‌ی واقعی می‌تواند فرق کند
+
 function bulkRenderStaged(jobId, filename, rowCount) {
-  bulkStagedMode = 'smart';
+  const isLarge = rowCount > LARGE_FILE_THRESHOLD;
+  bulkStagedMode = isLarge ? null : 'smart';  // برای فایل بزرگ، هیچ حالتی پیش‌فرض انتخاب نمی‌شود — انتخاب باید آگاهانه باشد
+
+  const smartCalls = rowCount * 2;
+  const quotaPct = Math.round((smartCalls / ASSUMED_DAILY_QUOTA) * 100);
+  const warning = isLarge ? `
+    <div class="bulk-error" style="background:rgba(240,180,40,.1);border-color:#F0B428;color:#F0B428;">
+      این فایل ${rowCount.toLocaleString('fa')} ردیف دارد. حالت «هوشمند» یعنی
+      ${smartCalls.toLocaleString('fa')} فراخوانی API (~${quotaPct.toLocaleString('fa')}٪ از یک سهمیه‌ی روزانه‌ی معمول ۱۰٬۰۰۰تایی
+      در یک آپلود). لطفاً حالت را آگاهانه انتخاب کنید.
+    </div>` : '';
+
   document.getElementById('bulkBody').innerHTML = `
     <div class="bulk-file-name">📄 ${escapeHtml(filename)} — ${rowCount.toLocaleString('fa')} ردیف</div>
+    ${warning}
     <div class="bulk-modes">
-      <div class="bulk-mode-card" id="bulkModeFast" onclick="bulkSelectMode('fast')">
+      <div class="bulk-mode-card${bulkStagedMode === 'fast' ? ' selected' : ''}" id="bulkModeFast" onclick="bulkSelectMode('fast')">
         <div class="bulk-mode-title">سریع</div>
         <div class="bulk-mode-cost">رایگان، بدون فراخوانی API — برای یک بررسی اولیه</div>
       </div>
-      <div class="bulk-mode-card selected" id="bulkModeSmart" onclick="bulkSelectMode('smart')">
+      <div class="bulk-mode-card${bulkStagedMode === 'smart' ? ' selected' : ''}" id="bulkModeSmart" onclick="bulkSelectMode('smart')">
         <div class="bulk-mode-title">هوشمند</div>
-        <div class="bulk-mode-cost">${rowCount.toLocaleString('fa')} سطر × ۲ فراخوانی = ${(rowCount*2).toLocaleString('fa')} فراخوانی API</div>
+        <div class="bulk-mode-cost">${rowCount.toLocaleString('fa')} سطر × ۲ فراخوانی = ${smartCalls.toLocaleString('fa')} فراخوانی API</div>
       </div>
     </div>
     <div class="search-box">
-      <button class="btn" onclick="bulkStart('${jobId}')">شروع پردازش</button>
+      <button class="btn" onclick="bulkStart('${jobId}')" id="bulkStartBtn" ${bulkStagedMode ? '' : 'disabled'}>شروع پردازش</button>
       <button class="link-btn" onclick="bulkRenderIdle()">انصراف</button>
     </div>
   `;
@@ -351,9 +366,12 @@ function bulkSelectMode(m) {
   bulkStagedMode = m;
   document.getElementById('bulkModeFast').classList.toggle('selected', m === 'fast');
   document.getElementById('bulkModeSmart').classList.toggle('selected', m === 'smart');
+  const startBtn = document.getElementById('bulkStartBtn');
+  if (startBtn) startBtn.disabled = false;
 }
 
 async function bulkStart(jobId) {
+  if (!bulkStagedMode) return;  // دفاعی؛ دکمه تا انتخاب حالت غیرفعال است
   try {
     const r = await fetch('/api/bulk/start', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -408,8 +426,16 @@ async function bulkPollJob(jobId) {
 }
 
 function bulkRenderDone(jobId, s) {
+  const quotaStopped = s.stopped_reason === 'quota_exhausted';
+  const message = quotaStopped
+    ? `<div class="bulk-error" style="background:rgba(240,180,40,.1);border-color:#F0B428;color:#F0B428;">
+         سهمیه‌ی روزانه‌ی API تمام شد — ${(s.processed || 0).toLocaleString('fa')} از ${(s.row_count || 0).toLocaleString('fa')}
+         ردیف پردازش شد. نتیجه‌ی همین بخش را دانلود کنید؛ برای ادامه، همین فایل نتیجه را بعد از تمدید سهمیه دوباره
+         آپلود کنید — ردیف‌های تمام‌شده تکرار نمی‌شوند.
+       </div>`
+    : `<div class="bulk-done-text">✓ پردازش «${escapeHtml(s.original_filename || '')}» کامل شد.</div>`;
   document.getElementById('bulkBody').innerHTML = `
-    <div class="bulk-done-text">✓ پردازش «${escapeHtml(s.original_filename || '')}» کامل شد.</div>
+    ${message}
     <div class="search-box">
       <a class="btn" style="text-decoration:none;display:inline-block" href="/api/bulk/result/${jobId}">دانلود نتیجه</a>
       <button class="link-btn" onclick="bulkRenderIdle()">آپلود فایل جدید</button>

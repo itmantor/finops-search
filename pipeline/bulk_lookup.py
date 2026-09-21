@@ -15,7 +15,6 @@ import json
 import re
 import sys
 import threading
-from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -23,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from common.config import OPENAI_API_KEY
 from common.textnorm import tokenize
+from common.utils import JsonlCheckpoint
 from search.ambiguity import (
     apply_context_boost, compute_ambiguity,
     representative_per_group, resolve_ambiguous_group_by_context,
@@ -41,6 +41,13 @@ from pipeline.bulk_shared import (
 MAX_WORKERS = 8
 RETRIEVE_LIMIT = 200
 OPTION_SEP = " | "
+ROW_INDEX_KEY = "__row_index__"  # فقط داخلی؛ در نوشتن result.xlsx نادیده گرفته می‌شود
+CHECKPOINT_FILENAME = "progress.jsonl"
+
+
+def _looks_like_rate_limit(exc):
+    text = str(exc).lower()
+    return "rate_limit" in text or "429" in text
 
 
 def load_status(job_dir):
@@ -253,44 +260,85 @@ def main():
         input_path = job_dir / status["input_filename"]
         headers, rows = read_rows(input_path)
         header_order = output_header_order(headers)
+        for i, row in enumerate(rows):
+            row[ROW_INDEX_KEY] = i  # کلید پایدار برای checkpoint، فارغ از خروجی ستون‌ها
 
         already_done, resolved_locally, needs_search = classify_rows(rows)
 
-        status.update(status="processing", processed=len(already_done) + len(resolved_locally),
-                       total=len(rows), total_to_search=len(needs_search))
+        # checkpoint سطح-ردیف (نه ستون‌های خروجی خودِ فایل): اگر این اسکریپت روی
+        # همین job_dir دوباره اجرا شود (بعد از crash یا ری‌استارت سرور، نگاه کنید
+        # به server/app.py:_resume_stale_bulk_jobs)، ردیف‌هایی که قبلاً همین‌جا
+        # تمام شده‌اند دوباره پردازش/فراخوانی API نمی‌شوند.
+        ckpt = JsonlCheckpoint(job_dir / CHECKPOINT_FILENAME, key_field=ROW_INDEX_KEY)
+        ckpt_by_index = {r[ROW_INDEX_KEY]: r for r in ckpt.load_all()}
+        still_needs_search = []
+        for row in needs_search:
+            cached = ckpt_by_index.get(row[ROW_INDEX_KEY])
+            if cached is not None:
+                row.update({k: v for k, v in cached.items() if k != ROW_INDEX_KEY})
+            else:
+                still_needs_search.append(row)
+
+        already_done_count = len(already_done) + len(resolved_locally) + (len(needs_search) - len(still_needs_search))
+        status.update(status="processing", processed=already_done_count,
+                       total=len(rows), total_to_search=len(still_needs_search), stopped_reason=None)
         save_status(job_dir, status)
 
-        print(f"📦 {len(rows)} ردیف — {len(already_done)} قبلاً نهایی، "
-              f"{len(resolved_locally)} با انتخاب کاربر حل شد، {len(needs_search)} نیاز به جستجو.")
+        print(f"📦 {len(rows)} ردیف — {already_done_count} قبلاً نهایی (شامل checkpoint اجرای قبلی)، "
+              f"{len(still_needs_search)} نیاز به جستجو.")
 
         for row, resolution in resolved_locally:
             row.update(resolution)
 
-        if needs_search:
+        quota_exhausted = threading.Event()
+
+        if still_needs_search:
             engine = load_engine()
             lock = threading.Lock()
-            done_count = status["processed"]
+            done_count = already_done_count
 
             def worker(row):
-                return row, process_row(engine, mode, row)
+                if quota_exhausted.is_set():
+                    return row, None
+                try:
+                    return row, process_row(engine, mode, row)
+                except Exception as e:
+                    print(f"  ⚠️  ردیف {row[ROW_INDEX_KEY]} خطا داد: {e}")
+                    if _looks_like_rate_limit(e):
+                        quota_exhausted.set()
+                    return row, None
 
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                futures = [executor.submit(worker, row) for row in needs_search]
+                futures = [executor.submit(worker, row) for row in still_needs_search]
                 for future in as_completed(futures):
                     row, result = future.result()
-                    row.update(result)
-                    with lock:
-                        done_count += 1
-                        status["processed"] = done_count
-                        save_status(job_dir, status)
-                    print(f"  ✓ {done_count}/{len(rows)} — {result[COL_OUT_STATUS]}")
+                    if result is not None:
+                        row.update(result)
+                        ckpt.append({ROW_INDEX_KEY: row[ROW_INDEX_KEY], **result})
+                        with lock:
+                            done_count += 1
+                            status["processed"] = done_count
+                            save_status(job_dir, status)
+                        print(f"  ✓ {done_count}/{len(rows)} — {result[COL_OUT_STATUS]}")
+                    if quota_exhausted.is_set():
+                        for f in futures:
+                            f.cancel()  # فقط آن‌هایی که هنوز شروع نشده‌اند لغو می‌شوند
 
         result_path = job_dir / "result.xlsx"
         write_result_xlsx(result_path, header_order, rows)
 
-        status.update(status="done", processed=len(rows), result_filename="result.xlsx")
-        save_status(job_dir, status)
-        print(f"✅ کامل شد → {result_path}")
+        if quota_exhausted.is_set():
+            remaining = len(rows) - status["processed"]
+            status.update(status="done", result_filename="result.xlsx",
+                           stopped_reason="quota_exhausted")
+            save_status(job_dir, status)
+            print(f"⏸  سهمیه‌ی روزانه‌ی API تمام شد — {status['processed']}/{len(rows)} پردازش شد، "
+                  f"{remaining} ردیف باقی مانده. فایل را بعد از تمدید سهمیه دوباره آپلود کنید تا ادامه یابد "
+                  f"(ردیف‌های تمام‌شده تکرار نمی‌شوند).")
+        else:
+            status.update(status="done", processed=len(rows), result_filename="result.xlsx")
+            save_status(job_dir, status)
+            print(f"✅ کامل شد → {result_path}")
 
     except Exception as e:
         status.update(status="error", error=str(e))
